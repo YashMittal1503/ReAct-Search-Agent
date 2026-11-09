@@ -170,3 +170,29 @@ def test_parse_chain_validation() -> None:
     assert [t.label for t in parse_chain("groq:a, groq:a, openrouter:x/y:free")] == ["groq:a", "openrouter:x/y:free"]
     with pytest.raises(ValueError):
         parse_chain("groq")
+
+
+# ---------------------------------------------------------------------------
+# Provider error details (#6)
+# ---------------------------------------------------------------------------
+def _with_body(status: int, body: object) -> openai.APIStatusError:
+    response = httpx.Response(status, request=httpx.Request("POST", "https://api.test/v1/chat"))
+    return openai.APIStatusError(f"Error code: {status}", response=response, body=body)
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ({"error": {"message": "Invalid  schema\nfor function"}}, "Invalid schema for function"),  # OpenAI-style
+        ([{"error": {"code": 400, "message": "Function call is missing a thought_signature"}}],
+         "Function call is missing a thought_signature"),                                         # Gemini (list)
+        ({"object": "error", "message": "Rate limit exceeded", "code": "1300"}, "Rate limit exceeded"),  # Mistral
+        ("plain text body", "plain text body"),
+        (None, ""),  # falls back to str(exc) minus the "Error code: NNN" prefix
+    ],
+)
+def test_error_detail_extraction(body: object, expected: str) -> None:
+    from agent.resilience.errors import error_detail
+
+    assert error_detail(_with_body(400, body)) == expected
+    assert classify_error(_with_body(400, body)).detail == expected

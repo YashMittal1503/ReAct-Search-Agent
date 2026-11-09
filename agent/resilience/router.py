@@ -62,6 +62,8 @@ ClientFactory = Callable[[ProviderSpec, str, str], BaseChatModel]
 
 #: Headroom added to the prompt estimate for the completion when checking TPM budgets.
 COMPLETION_TOKEN_ALLOWANCE = 800
+#: Characters of the provider's error message appended to failover trace events.
+DETAIL_CHARS = 150
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +301,10 @@ class ModelRouter:
         else:  # INCOMPATIBLE
             skip.add(target)
             msg = f"{target.label} rejected the request ({err.status}) → trying another provider"
-        self._emit("failover", msg, provider=target.provider, model=target.model, key=slot.masked, error=err.kind.value)
+        if err.detail:
+            msg += f" — {err.detail[:DETAIL_CHARS]}{'…' if len(err.detail) > DETAIL_CHARS else ''}"
+        self._emit("failover", msg, provider=target.provider, model=target.model, key=slot.masked,
+                   error=err.kind.value, detail=err.detail[:500])
         return True
 
     def _finish(self, target: ModelTarget, slot: KeySlot, message: AIMessage, started: float,
