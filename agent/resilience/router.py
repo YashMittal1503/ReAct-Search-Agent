@@ -89,6 +89,28 @@ def router_events(listener: Callable[[RouterEvent], None] | None) -> Iterator[No
         _listener.reset(token)
 
 
+#: Per-run routing affinity: role -> the target that last served that role in this context.
+_affinity: ContextVar[dict[str, ModelTarget] | None] = ContextVar("router_affinity", default=None)
+
+
+@contextmanager
+def routing_session() -> Iterator[dict[str, ModelTarget]]:
+    """Scope for **sticky routing**: calls inside it prefer the target that last succeeded.
+
+    One graph-node run (e.g. a whole ReAct research loop, including sub-agent tasks, which inherit
+    the context) is one session. Sticking to one provider keeps a conversation from mixing
+    providers mid-stream, which avoids cross-provider incompatibilities and keeps prompt caches warm.
+    Stickiness only *reorders* the attempt plan: if the preferred target isn't ready, the normal
+    tier order applies.
+    """
+    state: dict[str, ModelTarget] = {}
+    token = _affinity.set(state)
+    try:
+        yield state
+    finally:
+        _affinity.reset(token)
+
+
 class AllProvidersExhaustedError(RuntimeError):
     """Every key of every provider in the chain failed or is unavailable."""
 
@@ -180,9 +202,10 @@ class ModelRouter:
         return bool(self.chains.get("main"))
 
     def _default_client(self, spec: ProviderSpec, key: str, model: str) -> BaseChatModel:
-        from langchain_openai import ChatOpenAI
+        """OpenAI-compatible client whose payload is adapted to the provider's quirks."""
+        from agent.resilience.adapters import ADAPTERS, AdaptedChatOpenAI
 
-        return ChatOpenAI(
+        return AdaptedChatOpenAI(
             model=model,
             api_key=key,
             base_url=spec.base_url,
@@ -190,6 +213,7 @@ class ModelRouter:
             timeout=self.timeout,
             max_retries=0,  # the router handles retries/failover; no hidden SDK backoff sleeps
             default_headers=dict(spec.headers) or None,
+            payload_adapter=ADAPTERS.get(spec.name),
         )
 
     def _client(self, target: ModelTarget, slot: KeySlot) -> BaseChatModel:
@@ -218,7 +242,8 @@ class ModelRouter:
         return self.stats.setdefault(target.label, TargetStats())
 
     # ------------------------------------------------------------------ attempt planning
-    def _attempts(self, role: str, tokens: int, skip: set[ModelTarget]) -> Iterator[tuple[ModelTarget, KeySlot, float]]:
+    def _attempts(self, role: str, tokens: int, skip: set[ModelTarget],
+                  preferred: ModelTarget | None = None) -> Iterator[tuple[ModelTarget, KeySlot, float]]:
         """Yield ``(target, key_slot, wait_seconds)`` in the order they should be tried.
 
         ``skip`` is shared with the caller, which adds targets that must not be retried during
@@ -231,6 +256,8 @@ class ModelRouter:
                 "MISTRAL_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY, OPENAI_API_KEY or LLM_BASE_URL in .env."
             )
         live = [t for t in chain if not self._is_dead(t)]
+        if preferred in live:  # sticky routing: try the last successful target first
+            live = [preferred, *(t for t in live if t != preferred)]
         tried: set[tuple[ModelTarget, str]] = set()
 
         # Pass 1: anything that can be sent *right now*, in tier order, keys round-robin.
@@ -338,7 +365,8 @@ class ModelRouter:
         skip: set[ModelTarget] = set()
         first: ModelTarget | None = None
         last: Exception | None = None
-        for target, slot, wait in self._attempts(role, tokens, skip):
+        affinity = _affinity.get()
+        for target, slot, wait in self._attempts(role, tokens, skip, affinity.get(role) if affinity is not None else None):
             if wait > 0:
                 self._emit("failover", f"All providers at capacity → waiting {wait:.1f}s for {target.label}")
                 await asyncio.sleep(wait)
@@ -352,6 +380,8 @@ class ModelRouter:
                 if not self._on_failure(target, slot, exc, skip):
                     raise
                 continue
+            if affinity is not None:
+                affinity[role] = target
             return self._finish(target, slot, message, started, first)
         raise self._exhausted(role, last) from last
 
@@ -363,7 +393,8 @@ class ModelRouter:
         skip: set[ModelTarget] = set()
         first: ModelTarget | None = None
         last: Exception | None = None
-        for target, slot, wait in self._attempts(role, tokens, skip):
+        affinity = _affinity.get()
+        for target, slot, wait in self._attempts(role, tokens, skip, affinity.get(role) if affinity is not None else None):
             if wait > 0:
                 self._emit("failover", f"All providers at capacity → waiting {wait:.1f}s for {target.label}")
                 time.sleep(wait)
@@ -377,6 +408,8 @@ class ModelRouter:
                 if not self._on_failure(target, slot, exc, skip):
                     raise
                 continue
+            if affinity is not None:
+                affinity[role] = target
             return self._finish(target, slot, message, started, first)
         raise self._exhausted(role, last) from last
 
