@@ -30,7 +30,13 @@ from agent.prompts import CLARIFIER_SYSTEM, EVALUATOR_SYSTEM, PLANNER_SYSTEM, SY
 from agent.researcher import build_research_agent
 from agent.resilience.key_pool import KeyPool, parse_keys
 from agent.resilience.providers import load_env
-from agent.resilience.router import AllProvidersExhaustedError, ModelRouter, RouterEvent, router_events
+from agent.resilience.router import (
+    AllProvidersExhaustedError,
+    ModelRouter,
+    RouterEvent,
+    router_events,
+    routing_session,
+)
 from agent.state import ResearchState
 from schemas.clarification import ClarificationRequest, ClarityAssessment
 from schemas.events import TraceEvent
@@ -135,7 +141,7 @@ def with_router_events(fn: Callable[[ResearchState], Awaitable[dict[str, Any]]])
                 kind = "failover" if ev.kind == "failover" else "error"
                 writer({"trace": TraceEvent(kind=kind, node="llm-router", message=ev.message, data=ev.data).model_dump()})
 
-        with router_events(listener):
+        with router_events(listener), routing_session():
             return await fn(state)
 
     return wrapper

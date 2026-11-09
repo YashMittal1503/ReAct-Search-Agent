@@ -3,6 +3,7 @@
 * :mod:`~agent.resilience.key_pool`: per-provider key pools (round-robin, RPM/TPM budgets, cooldowns)
 * :mod:`~agent.resilience.errors`: provider-agnostic error classification + Retry-After parsing
 * :mod:`~agent.resilience.providers`: provider registry, tier order, model chains
+* :mod:`~agent.resilience.adapters`: per-provider payload adapters (Mistral ids, Gemini signatures)
 * :mod:`~agent.resilience.router`: :class:`ModelRouter` + LangChain :class:`ResilientChatModel`
 """
 
@@ -15,6 +16,7 @@ from agent.resilience.router import (
     ResilientChatModel,
     RouterEvent,
     router_events,
+    routing_session,
 )
 
 __all__ = [
@@ -36,4 +38,5 @@ __all__ = [
     "parse_chain",
     "parse_keys",
     "router_events",
+    "routing_session",
 ]
