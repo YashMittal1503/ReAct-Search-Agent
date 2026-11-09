@@ -17,8 +17,10 @@ from schemas import (
     ClarityAssessment,
     EvidenceEvaluation,
     ResearchPlan,
+    KeyPoint,
     ScrapedPage,
     SearchResult,
+    SourceNotes,
     SubQuery,
     SynthesisDraft,
     TraceEvent,
@@ -34,11 +36,15 @@ QUOTE = "Monoliths remain simpler to operate for small teams with limited platfo
 class FakeLLM:
     """Returns canned structured objects keyed by schema; records calls."""
 
-    def __init__(self) -> None:
+    def __init__(self, extract: str = "ok") -> None:
         self.calls: dict[str, int] = {}
+        self.max_tokens: dict[str, int | None] = {}
+        self.synthesis_prompt = ""
+        self.extract = extract  # "ok" | "fail" | "irrelevant"
 
-    async def __call__(self, schema: type, messages: list[BaseMessage], fast: bool) -> Any:
+    async def __call__(self, schema: type, messages: list[BaseMessage], fast: bool, max_tokens: int | None = None) -> Any:
         n = self.calls[schema.__name__] = self.calls.get(schema.__name__, 0) + 1
+        self.max_tokens[schema.__name__] = max_tokens
         prompt = str(messages[-1].content)
         if schema is ClarityAssessment:
             request = prompt.split('"""')[1]
@@ -51,7 +57,14 @@ class FakeLLM:
         if schema is EvidenceEvaluation:
             return EvidenceEvaluation(is_sufficient=n >= 2, coverage_summary="ok", gaps=[] if n >= 2 else ["team size"],
                                       conflicting_claims=["A says X, B says Y"], confidence=0.7)
+        if schema is SourceNotes:
+            if self.extract == "fail":
+                raise ValueError("model returned invalid JSON")
+            if self.extract == "irrelevant":
+                return SourceNotes(relevant=False)
+            return SourceNotes(relevant=True, key_points=[KeyPoint(claim="Monoliths suit small teams", quote=QUOTE)])
         if schema is SynthesisDraft:
+            self.synthesis_prompt = prompt
             return SynthesisDraft(
                 answer="**TL;DR** Monoliths win for small teams [2]. Microservices scale orgs [1, 2]. Bogus [99].\n\n## Sources\n- junk",
                 confidence_score=0.8,
@@ -106,13 +119,13 @@ class FakeAgent:
         yield {"model": {"messages": [AIMessage(content="Notes: monoliths simpler (https://shared.com/post)")]}}
 
 
-def _graph(fail_agent: bool = False, max_iterations: int = 4):
+def _graph(fail_agent: bool = False, max_iterations: int = 4, llm: FakeLLM | None = None):
     settings = Settings(max_iterations=max_iterations,
                         max_scrapes_per_iteration=3, _env_file=None)
     deps = AgentDeps(
         settings=settings,
         llm_factory=lambda fast: None,  # type: ignore[arg-type,return-value]
-        structured=FakeLLM(),
+        structured=llm or FakeLLM(),
         searcher_factory=FakeSearcher,  # type: ignore[arg-type]
         scraper_factory=FakeScraper,  # type: ignore[arg-type]
         agent_factory=lambda **kw: FakeAgent(kw["tools"], fail_agent),
@@ -188,3 +201,36 @@ def test_real_deepagents_and_react_engines_compile() -> None:
     for engine in ("deep", "react"):
         agent = build_research_agent(engine=engine, model=model, tools=tools, today="today")
         assert hasattr(agent, "astream")
+
+
+# ---------------------------------------------------------------------------
+# Two-step synthesis (#3)
+# ---------------------------------------------------------------------------
+async def _run_once(llm: FakeLLM) -> RunResult:
+    session = ResearchSession(_graph(max_iterations=1, llm=llm))
+    items = await _collect(session, "Pros and cons of microservices vs monoliths for startups in 2026")
+    assert isinstance(items[-1], RunResult)
+    return items[-1]
+
+
+async def test_synthesis_uses_extracted_key_points_with_explicit_caps() -> None:
+    llm = FakeLLM()
+    result = await _run_once(llm)
+    assert "Key points:" in llm.synthesis_prompt and QUOTE in llm.synthesis_prompt
+    assert "Intro text about architecture" not in llm.synthesis_prompt  # raw page text no longer sent
+    assert llm.max_tokens == {**llm.max_tokens, "SourceNotes": 1_024, "SynthesisDraft": 4_096}
+    assert any(s.quote_verified for s in result.report.sources)
+
+
+async def test_extraction_failure_falls_back_to_raw_excerpt() -> None:
+    llm = FakeLLM(extract="fail")
+    result = await _run_once(llm)
+    assert "Excerpt: # Page" in llm.synthesis_prompt  # raw excerpt used instead of key points
+    assert result.report.sources  # report still produced
+
+
+async def test_irrelevant_pages_are_dropped_from_synthesis() -> None:
+    llm = FakeLLM(extract="irrelevant")
+    await _run_once(llm)
+    assert "shared.com" not in llm.synthesis_prompt  # the only scraped page was judged irrelevant
+    assert "Snippet: About" in llm.synthesis_prompt  # snippet-only sources still present

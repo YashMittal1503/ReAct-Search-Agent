@@ -26,7 +26,7 @@ from pydantic import BaseModel
 from agent.citations import build_report
 from agent.config import Settings
 from agent.llm import build_chat_model, build_router, structured_call
-from agent.prompts import CLARIFIER_SYSTEM, EVALUATOR_SYSTEM, PLANNER_SYSTEM, SYNTHESIZER_SYSTEM
+from agent.prompts import CLARIFIER_SYSTEM, EVALUATOR_SYSTEM, EXTRACTOR_SYSTEM, PLANNER_SYSTEM, SYNTHESIZER_SYSTEM
 from agent.researcher import build_research_agent
 from agent.resilience.key_pool import KeyPool, parse_keys
 from agent.resilience.providers import load_env
@@ -40,7 +40,7 @@ from agent.resilience.router import (
 from agent.state import ResearchState
 from schemas.clarification import ClarificationRequest, ClarityAssessment
 from schemas.events import TraceEvent
-from schemas.evidence import Evidence, EvidenceEvaluation
+from schemas.evidence import Evidence, EvidenceEvaluation, SourceNotes
 from schemas.planning import ResearchPlan, SubQuery
 from schemas.report import BARE_CITATION_RE, ResearchReport, SynthesisDraft
 from tools.langchain_tools import ToolBudget, make_research_tools
@@ -51,10 +51,18 @@ from tools.url_registry import URLRegistry
 logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
 
-StructuredFn = Callable[[type[T], list[BaseMessage], bool], Awaitable[T]]
+StructuredFn = Callable[..., Awaitable[Any]]
+"""``(schema, messages, fast, *, max_tokens=None) -> schema instance``."""
 
 #: Errors after which a control node degrades gracefully instead of failing the whole run.
 RECOVERABLE_LLM_ERRORS = (ValueError, AllProvidersExhaustedError)
+
+# Two-step synthesis (step 1: per-source key points, step 2: report from the notes).
+EXTRACT_CHARS = 6_000          # page text read by the extractor (old synthesizer saw 2,500)
+EXTRACT_MAX_TOKENS = 1_024
+EXTRACT_CONCURRENCY = 4
+FALLBACK_EXCERPT_CHARS = 1_500  # used when extraction fails
+SYNTH_MAX_TOKENS = 4_096        # the report itself needs a larger completion cap
 
 
 # ---------------------------------------------------------------------------
@@ -93,8 +101,13 @@ class AgentDeps:
         if self.structured is None:
             llm_factory = self.llm_factory
 
-            async def _structured(schema: type[T], messages: list[BaseMessage], fast: bool) -> T:
-                return await structured_call(llm_factory(fast), schema, messages, method=s.llm_structured_method)
+            router_ref = self.router
+
+            async def _structured(schema: type[T], messages: list[BaseMessage], fast: bool,
+                                  max_tokens: int | None = None) -> T:
+                model = (router_ref.chat_model("fast" if fast else "main", max_tokens=max_tokens)
+                         if router_ref is not None and max_tokens else llm_factory(fast))
+                return await structured_call(model, schema, messages, method=s.llm_structured_method)
 
             self.structured = _structured
         if self.searcher_factory is None:
@@ -187,8 +200,11 @@ class ResearchNodes:
         self.deps = deps
         self.s = deps.settings
 
-    async def _structured(self, schema: type[T], messages: list[BaseMessage], *, fast: bool) -> T:
+    async def _structured(self, schema: type[T], messages: list[BaseMessage], *, fast: bool,
+                          max_tokens: int | None = None) -> T:
         assert self.deps.structured is not None
+        if max_tokens:
+            return await self.deps.structured(schema, messages, fast, max_tokens=max_tokens)
         return await self.deps.structured(schema, messages, fast)
 
     # ------------------------------------------------------------------ 1. Ambiguity gate
@@ -465,7 +481,17 @@ class ResearchNodes:
             )
             return {"report": report.model_dump()}
 
-        digest = _evidence_digest(evidence, per_item=2_500, budget=30_000)
+        # Step 1: distil each scraped page into key points with verbatim quotes (fast chain, parallel).
+        notes = await self._extract_notes(question, evidence)
+        evidence = [ev for ev, _ in notes]  # irrelevant sources dropped; numbering follows this list
+        digest = "\n\n---\n\n".join(
+            f"[{i}] {ev.title} — {ev.domain} (relevance {ev.score:.2f})\n{body}"
+            for i, (ev, body) in enumerate(notes, start=1)
+        )
+        emit("observation", "synthesize",
+             f"Synthesis prompt: {len(evidence)} sources, ≈{len(digest) // 4:,} tokens of evidence")
+
+        # Step 2: write the report from the distilled notes.
         conflicts = evaluation.get("conflicting_claims", [])
         try:
             draft = await self._structured(
@@ -476,6 +502,7 @@ class ResearchNodes:
                                  if conflicts else "")
                               + f"Numbered evidence:\n\n{digest}")],
                 fast=False,
+                max_tokens=SYNTH_MAX_TOKENS,
             )
             report = build_report(draft, evidence, evaluator_confidence=evaluation.get("confidence"),
                                   extra_contradictions=conflicts)
@@ -495,3 +522,45 @@ class ResearchNodes:
              f"Report ready: {len(report.sources)} cited sources ({verified} quotes verified), "
              f"confidence {report.confidence_score:.2f}")
         return {"report": report.model_dump()}
+
+    async def _extract_notes(self, question: str, evidence: list[Evidence]) -> list[tuple[Evidence, str]]:
+        """Two-step synthesis, step 1: per-source key points with verbatim quotes.
+
+        * Snippet-only sources are already short and are passed through unchanged.
+        * Scraped pages are read up to :data:`EXTRACT_CHARS` (more than the old 2.5k-char excerpt)
+          by the fast chain, in parallel; the router spreads the calls across keys.
+        * A page the extractor marks irrelevant is dropped; an extraction failure falls back to a raw
+          excerpt, so a flaky model can never remove evidence. If everything were dropped, all
+          sources are kept as snippets.
+        """
+        pages = [ev for ev in evidence if ev.content]
+        if pages:
+            emit("status", "synthesize", f"Extracting key points from {len(pages)} pages…")
+        sem = asyncio.Semaphore(EXTRACT_CONCURRENCY)
+
+        async def one(ev: Evidence) -> tuple[Evidence, str] | None:
+            if not ev.content:
+                return ev, f"Snippet: {ev.snippet}"
+            async with sem:
+                try:
+                    notes = await self._structured(
+                        SourceNotes,
+                        [SystemMessage(EXTRACTOR_SYSTEM),
+                         HumanMessage(f"Research question:\n\"\"\"{question}\"\"\"\n\n"
+                                      f"Source: {ev.title} ({ev.domain})\n\n{ev.content[:EXTRACT_CHARS]}")],
+                        fast=True,
+                        max_tokens=EXTRACT_MAX_TOKENS,
+                    )
+                except RECOVERABLE_LLM_ERRORS as exc:
+                    emit("error", "synthesize", f"Key-point extraction failed for {ev.domain} ({type(exc).__name__}); "
+                                                "using a raw excerpt")
+                    return ev, f"Excerpt: {ev.content[:FALLBACK_EXCERPT_CHARS]}"
+            if not notes.key_points:
+                if notes.relevant:
+                    return ev, f"Excerpt: {ev.content[:FALLBACK_EXCERPT_CHARS]}"
+                emit("thought", "synthesize", f"Dropped {ev.domain}: not relevant to the question")
+                return None
+            return ev, "Key points:\n" + "\n".join(f"- {kp.claim} — “{kp.quote}”" for kp in notes.key_points)
+
+        results = [r for r in await asyncio.gather(*(one(ev) for ev in evidence)) if r]
+        return results or [(ev, f"Snippet: {ev.snippet}") for ev in evidence]

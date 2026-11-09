@@ -347,3 +347,21 @@ async def test_groq_large_request_uses_higher_tpm_model() -> None:
     router = make_router(script, env=env, chain=["groq:openai/gpt-oss-120b", "groq:llama-3.3-70b-versatile"])
     await router.agenerate("main", [HumanMessage("word " * 7_000)])  # ~9.5k: over 8k, under 12k
     assert script.calls == [("groq", "g1", "llama-3.3-70b-versatile")]
+
+
+async def test_role_max_tokens_forwarded_and_used_for_budgeting() -> None:
+    script = Script()
+    router = make_router(script)
+    await router.chat_model("fast").ainvoke(MSGS)
+    assert script.kwargs[-1]["max_tokens"] == 1_024
+    await router.chat_model("main", max_tokens=4_096).ainvoke(MSGS)
+    assert script.kwargs[-1]["max_tokens"] == 4_096
+
+    # A tiny prompt with a 4,096-token completion cap can't fit a 3,000 TPM budget -> next tier.
+    script2 = Script()
+    env = {"GROQ_API_KEY": "g1", "GROQ_RPM": "0", "GROQ_TPM": "3000", "GEMINI_API_KEY": "ge1", "GEMINI_RPM": "0"}
+    router2 = make_router(script2, env=env)
+    await router2.chat_model("main", max_tokens=4_096).ainvoke(MSGS)
+    assert script2.calls == [("gemini", "ge1", "flash")]
+    await router2.chat_model("main", max_tokens=1_000).ainvoke(MSGS)
+    assert script2.calls[-1][0] == "groq"

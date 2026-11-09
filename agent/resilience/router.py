@@ -60,8 +60,11 @@ logger = logging.getLogger(__name__)
 ClientFactory = Callable[[ProviderSpec, str, str], BaseChatModel]
 """``(provider_spec, api_key, model) -> chat model`` used to talk to one key/model."""
 
-#: Headroom added to the prompt estimate for the completion when checking TPM budgets.
+#: Completion headroom used in budget estimates when a call sets no explicit ``max_tokens``.
 COMPLETION_TOKEN_ALLOWANCE = 800
+#: Default completion cap per role. Sent to the provider *and* used for TPM budgeting, so the
+#: estimate matches what providers like Groq count (prompt + requested completion).
+ROLE_MAX_TOKENS: dict[str, int] = {"main": 2_048, "fast": 1_024}
 #: Characters of the provider's error message appended to failover trace events.
 DETAIL_CHARS = 150
 
@@ -125,12 +128,12 @@ class TargetStats:
     latency_s: float = 0.0
 
 
-def estimate_tokens(messages: list[BaseMessage], tools: Any = None) -> int:
-    """Cheap prompt-size estimate (chars/4) plus tool schemas plus a completion allowance."""
+def estimate_tokens(messages: list[BaseMessage], tools: Any = None, completion: int | None = None) -> int:
+    """Cheap prompt-size estimate (chars/4) plus tool schemas plus the completion cap."""
     tokens = count_tokens_approximately(messages)
     if tools:
         tokens += len(json.dumps(tools, default=str)) // 4
-    return tokens + COMPLETION_TOKEN_ALLOWANCE
+    return tokens + (completion or COMPLETION_TOKEN_ALLOWANCE)
 
 
 # ---------------------------------------------------------------------------
@@ -191,11 +194,16 @@ class ModelRouter:
                    cooldown_base=settings.llm_cooldown_base_seconds, cooldown_max=settings.llm_cooldown_max_seconds,
                    temperature=settings.llm_temperature, timeout=settings.llm_timeout_seconds)
 
-    def chat_model(self, role: str = "main") -> "ResilientChatModel":
-        """A LangChain chat model bound to this router and a role's chain."""
+    def chat_model(self, role: str = "main", *, max_tokens: int | None = None) -> "ResilientChatModel":
+        """A LangChain chat model bound to this router and a role's chain.
+
+        Args:
+            role: ``main`` (research/synthesis) or ``fast`` (control steps).
+            max_tokens: Completion cap; defaults to :data:`ROLE_MAX_TOKENS` for the role.
+        """
         if role not in ROLES:
             raise ValueError(f"Unknown role {role!r}; expected one of {ROLES}")
-        return ResilientChatModel(router=self, role=role)
+        return ResilientChatModel(router=self, role=role, max_tokens=max_tokens or ROLE_MAX_TOKENS.get(role))
 
     @property
     def configured(self) -> bool:
@@ -369,7 +377,8 @@ class ModelRouter:
                         **kwargs: Any) -> ChatResult:
         """Async call with key rotation and cross-provider failover."""
         kwargs.pop("ls_structured_output_format", None)
-        tokens = estimate_tokens(messages, kwargs.get("tools"))
+        tokens = estimate_tokens(messages, kwargs.get("tools"),
+                                 kwargs.get("max_tokens") or kwargs.get("max_completion_tokens"))
         skip: set[ModelTarget] = set()
         first: ModelTarget | None = None
         last: Exception | None = None
@@ -397,7 +406,8 @@ class ModelRouter:
                  **kwargs: Any) -> ChatResult:
         """Synchronous twin of :meth:`agenerate`."""
         kwargs.pop("ls_structured_output_format", None)
-        tokens = estimate_tokens(messages, kwargs.get("tools"))
+        tokens = estimate_tokens(messages, kwargs.get("tools"),
+                                 kwargs.get("max_tokens") or kwargs.get("max_completion_tokens"))
         skip: set[ModelTarget] = set()
         first: ModelTarget | None = None
         last: Exception | None = None
@@ -463,6 +473,13 @@ class ResilientChatModel(BaseChatModel):
     router: Any = Field(exclude=True)
     role: str = "main"
     model_name: str = "resilient-router"
+    max_tokens: int | None = None
+    """Completion cap forwarded to every provider call (unless the caller sets one)."""
+
+    def _with_cap(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        if self.max_tokens and "max_tokens" not in kwargs and "max_completion_tokens" not in kwargs:
+            kwargs["max_tokens"] = self.max_tokens
+        return kwargs
 
     @property
     def _llm_type(self) -> str:
@@ -486,8 +503,8 @@ class ResilientChatModel(BaseChatModel):
 
     async def _agenerate(self, messages: list[BaseMessage], stop: list[str] | None = None,
                          run_manager: AsyncCallbackManagerForLLMRun | None = None, **kwargs: Any) -> ChatResult:
-        return await self.router.agenerate(self.role, messages, stop=stop, **kwargs)
+        return await self.router.agenerate(self.role, messages, stop=stop, **self._with_cap(kwargs))
 
     def _generate(self, messages: list[BaseMessage], stop: list[str] | None = None,
                   run_manager: CallbackManagerForLLMRun | None = None, **kwargs: Any) -> ChatResult:
-        return self.router.generate(self.role, messages, stop=stop, **kwargs)
+        return self.router.generate(self.role, messages, stop=stop, **self._with_cap(kwargs))

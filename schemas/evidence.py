@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, Field, computed_field, field_validator
 
 
 class SearchResult(BaseModel):
@@ -69,3 +69,22 @@ class EvidenceEvaluation(BaseModel):
         default_factory=list, description="New search queries that would close the gaps."
     )
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
+class KeyPoint(BaseModel):
+    """One claim from a source, backed by a verbatim quote."""
+
+    claim: str = Field(description="The claim in your own words (one sentence).")
+    quote: str = Field(description="A VERBATIM passage (8-40 words) copied exactly from the source that supports it.")
+
+
+class SourceNotes(BaseModel):
+    """Step 1 of two-step synthesis: the parts of one source that matter for the question."""
+
+    relevant: bool = Field(description="False if the source contains nothing useful for the question.")
+    key_points: list[KeyPoint] = Field(default_factory=list, description="2-5 most important points.")
+
+    @field_validator("key_points")
+    @classmethod
+    def _cap(cls, v: list[KeyPoint]) -> list[KeyPoint]:
+        return [kp for kp in v if kp.quote.strip()][:5]
