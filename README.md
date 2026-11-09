@@ -33,6 +33,7 @@ Clarify ──► Plan ──► Search ──► Selective Scrape ──► Eva
 11. [Walkthrough of a single request](#11-walkthrough-of-a-single-request)
 12. [Interview guide: talking points & likely questions](#12-interview-guide-talking-points--likely-questions)
 13. [Limitations & roadmap](#13-limitations--roadmap)
+14. [Development history](#14-development-history)
 
 ---
 
@@ -43,11 +44,11 @@ Clarify ──► Plan ──► Search ──► Selective Scrape ──► Eva
 | **Ambiguity detection (human-in-the-loop)** | A cheap length heuristic plus an LLM `ClarityAssessment`. If the prompt is vague, the graph **pauses** with LangGraph `interrupt()` and asks 2-3 targeted questions. Your chat reply **resumes the same thread**. |
 | **Query decomposition** | Turns the question into 2-4 non-overlapping search queries. On later iterations it **rewrites** queries to close identified gaps, and code filters out any query that already ran. |
 | **Deduplicated two-tier retrieval** | Tier 1, `search_web`: Tavily discovery with titles, URLs, scores and snippets. Tier 2, `scrape_page`: full-page Markdown via httpx + trafilatura, used **only** when a snippet is relevant but too thin. A session-level `URLRegistry` normalizes URLs (strips `utm_*`, `gclid`, fragments, `www.`, trailing slashes and so on) and drops duplicate URLs *and* duplicate snippets (mirrored content). |
-| **ReAct research engine** | A `deepagents` deep agent runs the Thought → Action → Observation loop. It gets a todo planner, a virtual scratch filesystem, auto-summarization, and a `source-reader` **sub-agent** it can delegate sub-questions to. |
+| **ReAct research engine** | A `deepagents` deep agent runs the Thought → Action → Observation loop and can delegate sub-questions to a `source-reader` **sub-agent**. Context stays small: unused harness tools are hidden from the model, and old tool results are cleared once the conversation grows (the data lives in the registry). |
 | **Reflection / self-correction** | An evaluator judges coverage, lists gaps and conflicting claims, and proposes follow-up queries. It loops back to the planner up to `MAX_ITERATIONS=4`. |
-| **Grounded synthesis** | The LLM writes Markdown with `[n]` markers and verbatim quotes. **Code** checks each quote against the retrieved text, builds `#:~:text=` deep links, rewrites markers to `[[n]](url)`, and Pydantic validates the citation contract. |
+| **Grounded synthesis** | **Two-step:** the fast models first extract 2–5 key points with verbatim quotes from each scraped page (in parallel); the report is then written from those notes with `[n]` markers. **Code** checks each quote against the retrieved text, builds `#:~:text=` deep links, rewrites markers to `[[n]](url)`, and Pydantic validates the citation contract. |
 | **Streamlit UI** | Chat interface, live `st.status("Researching...")` trace (including deduplicated URLs and skipped scrapes), a metrics row, the report, a contradictions panel, and **Verified Sources** cards with deep links, domain badges and exact quotes. You can also download the report as `.md`. |
-| **Rate-limit-proof LLM layer** | Multi-tier cross-provider failover with **multi-key pools** (unlimited keys per provider, round-robin), proactive RPM/TPM budgets, Retry-After-aware cooldowns and error-aware blame (key vs model vs provider). Exposed as one LangChain chat model, so deepagents and structured output use it unchanged. See [§4](#4-resilient-multi-provider-orchestration--multi-key-pools). |
+| **Rate-limit-proof LLM layer** | Multi-tier cross-provider failover with **multi-key pools** (unlimited keys per provider, round-robin), proactive **per-model** RPM/TPM budgets and context limits, Retry-After-aware cooldowns, error-aware blame (key vs model vs provider), per-provider request adapters and sticky routing. Exposed as one LangChain chat model, so deepagents and structured output use it unchanged. See [§4](#4-resilient-multi-provider-orchestration--multi-key-pools). |
 | **Provider-agnostic** | Any OpenAI-compatible endpoint (Groq, Cerebras, Mistral, Gemini, OpenRouter, OpenAI, vLLM, Ollama). Adding a tier means adding a key to `.env`. |
 
 ---
@@ -83,7 +84,7 @@ flowchart TB
     end
 
     subgraph Engine["agent/researcher.py — inner ReAct engine"]
-        DA["deepagents.create_deep_agent<br/>(todos · virtual FS · summarization · source-reader sub-agent)"]
+        DA["deepagents.create_deep_agent<br/>(source-reader sub-agent · tool allowlist · old-result clearing)"]
         RA["langchain create_agent<br/>(lightweight alternative)"]
     end
 
@@ -134,7 +135,8 @@ sequenceDiagram
     alt gaps and iteration < 4
         G->>L: rewritten ResearchPlan
     else sufficient
-        G->>L: SynthesisDraft ([n] markers + quotes)
+        G->>L: SourceNotes per scraped page (key points + verbatim quotes, parallel)
+        G->>L: SynthesisDraft from the notes ([n] markers + quotes)
         G->>G: verify quotes · deep links · [[n]](url) · Pydantic validate
         G-->>S: RunResult(ResearchReport)
     end
@@ -172,14 +174,23 @@ and runs the inner ReAct agent:
 
 | Tool | Behaviour enforced *in code* |
 |---|---|
-| `search_web(queries: list[str])` | Runs queries **concurrently** (`asyncio.gather`). Skips queries already run. Normalizes every URL, drops duplicate URLs and duplicate snippets, and emits `dedup` trace events. Returns compact snippets with relevance scores. |
-| `scrape_page(url, reason)` | **Guard rules:** (a) the URL must have been returned by `search_web` (blocks hallucinated URLs); (b) it must not be already scraped or in flight; (c) its relevance score must be ≥ `SCRAPE_RELEVANCE_THRESHOLD`; (d) the per-iteration budget must not be exhausted. The required `reason` argument makes the model justify *why the snippet lacks detail*. A refusal returns `SKIPPED: <reason>` and emits a `skip` event. A successful scrape returns only a 2.5k-char preview to keep the ReAct context small, while the full text (≤ 12k chars) is stored for the evaluator and synthesizer. |
+| `search_web(queries: list[str])` | Runs queries **concurrently** (`asyncio.gather`). Skips queries already run. Normalizes every URL, drops duplicate URLs and duplicate snippets, and emits `dedup` trace events. Returns compact (200-char) snippets with relevance scores. |
+| `scrape_page(url, reason)` | **Guard rules:** (a) the URL must have been returned by `search_web` (blocks hallucinated URLs); (b) it must not be already scraped or in flight; (c) its relevance score must be ≥ `SCRAPE_RELEVANCE_THRESHOLD`; (d) the per-iteration budget must not be exhausted. The required `reason` argument makes the model justify *why the snippet lacks detail*. A refusal returns `SKIPPED: <reason>` and emits a `skip` event. A successful scrape returns only a 1.2k-char preview to keep the ReAct context small, while the full text (≤ 12k chars) is stored for the evaluator and synthesizer. |
 
 **Scraper internals** (`tools/scraper.py`): a shared `httpx.AsyncClient` with timeouts, redirects,
 connection limits and a semaphore. It streams the body with a size cap, rejects non-HTML content
 types, and retries transient errors (429/5xx/transport) with backoff. `trafilatura.extract(...,
 output_format="markdown")` runs in `asyncio.to_thread` because it's CPU-bound, with a
 precision → recall fallback. **All failures come back as `ScrapedPage(ok=False, error=...)`, never as exceptions.**
+
+**Keeping the ReAct context small** (`agent/researcher.py`, applied to both engines and the sub-agent):
+- `ToolAllowlistMiddleware` exposes only `search_web`, `scrape_page`, `task` and `write_todos`.
+  deepagents' virtual-filesystem tools (`ls`, `read_file`, `grep`, …) are never used here, and hiding
+  them cuts the first `deep` request from ≈3.3k to ≈1.2k tokens.
+- LangChain's `ContextEditingMiddleware` + `ClearToolUsesEdit` replace older tool results with a
+  placeholder once the conversation passes ~3.5k tokens, keeping the 2 most recent verbatim. Nothing
+  is lost: every result is already stored in the `URLRegistry`, which is what the evaluator and
+  synthesizer read.
 
 **Resilience:** if the agent raises (rate limit, malformed tool call) or finishes without searching,
 the node runs a **deterministic fallback**: it searches every planned query, then scrapes the top-K
@@ -192,9 +203,15 @@ confidence}` is computed over a size-bounded, numbered evidence digest. The rout
 forward into the final report.
 
 ### ⑥ Grounded Synthesizer (`synthesize` + `agent/citations.py`)
-1. The LLM receives *numbered* evidence and returns a `SynthesisDraft`: a Markdown answer with `[n]`
-   markers, a list of `{source_id, verbatim supporting_quote}`, confidence and contradictions. **It
-   never writes URLs.**
+1. **Two-step synthesis.**
+   - *Step 1, extract:* for each scraped page, the fast chain returns `SourceNotes`: 2–5 key points,
+     each with a verbatim quote. It reads up to 6k chars per page, runs at most 4 at a time, and the
+     router spreads the calls across keys. Irrelevant pages are dropped; if extraction fails, a
+     1.5k-char raw excerpt is used instead. Snippet-only sources pass through unchanged.
+   - *Step 2, write:* the main chain receives the *numbered* notes (≈2.5–3k tokens of evidence
+     instead of ≈7.5k of raw excerpts) and returns a `SynthesisDraft`: a Markdown answer with `[n]`
+     markers, a list of `{source_id, verbatim supporting_quote}`, confidence and contradictions.
+     **It never writes URLs.**
 2. Deterministic post-processing:
    - normalizes `[1, 2]` → `[1][2]` and strips any links or "Sources" section the model added anyway;
    - **drops hallucinated ids** (e.g. `[99]`) and renumbers sources 1..k by first appearance;
@@ -234,26 +251,34 @@ flowchart LR
     R --> P1["KeyPool groq<br/>key1 key2 key3"]
     R --> P2["KeyPool gemini<br/>key1 …"]
     R --> P3["KeyPool openrouter …"]
-    P1 --> S["KeySlot (per key)<br/>RPM + TPM token buckets per model<br/>cooldowns per model · disable on auth"]
+    P1 --> S["KeySlot (per key)<br/>RPM + per-model TPM token buckets<br/>cooldowns per model · disable on auth"]
+    R --> A["AdaptedChatOpenAI<br/>per-provider payload adapters"]
     T["TavilySearcher"] --> PT["KeyPool tavily"]
 ```
 
 | Module | Responsibility |
 |---|---|
-| `providers.py` | Registry of OpenAI-compatible providers (base URL, default fast/main models, default RPM), tier order, `provider:model` chain parsing, key discovery from `.env` |
+| `providers.py` | Registry of OpenAI-compatible providers (base URL, default fast/main models, default RPM, **per-model TPM** and **context limits**), tier order, `provider:model` chain and limit parsing, key discovery from `.env` |
 | `key_pool.py` | `KeyPool` / `KeySlot`: round-robin rotation, **proactive RPM/TPM token buckets** per key and model, Retry-After-aware cooldowns with exponential backoff, auth disable, health snapshot, key masking |
-| `errors.py` | Maps any SDK exception (openai, httpx, Tavily) to an `ErrorKind` and extracts Retry-After from headers (`retry-after`, `retry-after-ms`, Groq `x-ratelimit-reset-*`) or messages ("try again in 7.66s") |
-| `router.py` | `ModelRouter` (attempt planning, failure policy, stats, events) and `ResilientChatModel`, which implements `bind_tools`, so deepagents, `create_agent` and `with_structured_output` work unchanged |
+| `errors.py` | Maps any SDK exception (openai, httpx, Tavily) to an `ErrorKind`, extracts Retry-After from headers (`retry-after`, `retry-after-ms`, Groq `x-ratelimit-reset-*`) or messages ("try again in 7.66s"), and pulls the provider's own error message out of the response body for the trace |
+| `adapters.py` | Makes one conversation portable across providers: Mistral gets deterministic 9-char tool-call ids, Gemini gets a placeholder `thought_signature` on historical tool calls, Mistral, Gemini and custom endpoints get `max_tokens` instead of `max_completion_tokens` |
+| `router.py` | `ModelRouter` (attempt planning, failure policy, sticky routing, stats, events) and `ResilientChatModel`, which implements `bind_tools` and sends an explicit `max_tokens` per role, so deepagents, `create_agent` and `with_structured_output` work unchanged |
 
 ### 4.2 How a call is routed
 
-1. **Estimate the request:** prompt tokens (approx.) + tool schemas + a completion allowance.
-2. **Ready pass (never waits):** walk the chain in tier order; for each model, try its keys
-   round-robin and take the first whose budgets and cooldowns allow sending now. Requests that
-   exceed a model's TPM capacity skip it instantly (no wasted 413 round trip).
-3. **Send** with SDK retries disabled (`max_retries=0`), so no hidden 1-2-4 s backoff sleeps happen
-   inside the SDK. The router fails over in milliseconds instead.
-4. **On failure, blame the right thing:**
+1. **Estimate the request:** prompt tokens (approx.) + tool schemas + the call's explicit
+   `max_tokens` (fast 1,024 · main 2,048 · synthesis 4,096). This matches how providers such as Groq
+   count a request: prompt plus requested completion.
+2. **Skip what can never fit:** a target whose context limit (e.g. Cerebras free tier ≈8k) or
+   per-model TPM capacity is smaller than the request is skipped without a call.
+3. **Ready pass (never waits):** walk the chain in tier order, starting with the target that last
+   succeeded in this graph-node run (**sticky routing**, so a conversation rarely mixes providers).
+   For each model, try its keys round-robin and take the first whose budgets and cooldowns allow
+   sending now.
+4. **Adapt and send:** the provider's payload adapter rewrites the request (tool-call ids, Gemini
+   signatures, `max_tokens`), and the call goes out with SDK retries disabled (`max_retries=0`), so no
+   hidden 1-2-4 s backoff sleeps happen inside the SDK. The router fails over in milliseconds instead.
+5. **On failure, blame the right thing:**
 
    | Error | Action |
    |---|---|
@@ -265,18 +290,21 @@ flowchart LR
    | invalid tool call | retry on a different model |
    | 5xx / timeout | short cooldown, fail over to the next provider |
    | our own bug | re-raise immediately |
-5. **Patience pass:** only if nothing anywhere is ready, wait for the soonest key/model (bounded by
+6. **Patience pass:** only if nothing anywhere is ready, wait for the soonest key/model (bounded by
    `LLM_MAX_WAIT_SECONDS`).
-6. **Observe:** every rotation is streamed into the UI trace as a 🔀 event (via a `ContextVar`
-   listener inherited by sub-agent tasks), counted in the report's *LLM failovers* metric, and shown
+7. **Observe:** every rotation is streamed into the UI trace as a 🔀 event, including the provider's
+   own error message (via a `ContextVar` listener inherited by sub-agent tasks), counted in the report's *LLM failovers* metric, and shown
    per key in the sidebar's **Provider health** panel.
 
 ### 4.3 Why this keeps research fast
 - **Avoid instead of absorb:** proactive budgets mean most 429s are never triggered. Traffic moves to
   the next key or tier *before* the limit.
 - **Round-robin across keys** spreads parallel sub-agent calls, so N keys ≈ N× throughput.
-- **Per-model cooldown scope:** Groq and Gemini limit per model, so a 429 on one model leaves the
-  key's other models usable.
+- **Per-model limits and cooldowns:** Groq and Gemini enforce limits per model, so budgets and
+  cooldowns are per model too. A 9.5k-token call that's too big for `gpt-oss-120b` (8k TPM) goes to
+  `llama-3.3-70b` (12k TPM) on the same Groq keys instead of leaving Groq entirely.
+- **Portable conversations:** payload adapters let Mistral and Gemini continue a conversation that
+  started on another provider. Before adapters, they rejected it (verified live for Gemini).
 - **Fast chain for control steps:** clarify, plan and evaluate run on small, fast models and keep the big
   models' budgets for research and synthesis.
 - **Process-wide state:** the router and pools are Streamlit `cache_resource` singletons, so cooldowns
@@ -303,6 +331,9 @@ flowchart LR
 | **Structured output with self-correction** | Open-weight models sometimes emit invalid tool arguments. `structured_call` feeds the validation error back once before failing, and each node has a graceful fallback. | One extra LLM call in the failure case. |
 | **Router as a `BaseChatModel`, not `with_fallbacks()`** | LangChain's `RunnableWithFallbacks` has no `bind_tools` (so deepagents can't use it), no key pools and no cooldown memory. A custom chat model makes failover invisible to every caller. | Owns its own retry/failover logic, which is fully unit-tested. |
 | **Proactive budgets + reactive cooldowns** | Budgets prevent most 429s, and cooldowns handle the rest using the provider's own Retry-After. | Budgets are estimates (chars/4 token counting); defaults are conservative free-tier values. |
+| **Hide unused tools and clear old tool results** | The ReAct history resent every earlier search result, and deepagents' filesystem tools added ~2.1k tokens to every call. Both are fixed with middleware rather than by forking the harness. | Old observations become a placeholder; the agent relies on its notes and the latest results. |
+| **Two-step synthesis** | Distilling each page into quoted key points shrinks the synthesis prompt ~3× and feeds verbatim quotes into citation verification. | An extra (parallel, fast-model) call per scraped page; extraction could miss a fact, so failures fall back to raw text. Quality is to be measured in [#7](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/7). |
+| **Per-provider payload adapters** | "OpenAI-compatible" APIs disagree on tool-call ids, thought signatures and token-limit field names, which broke mid-conversation failover. | A placeholder Gemini signature may slightly reduce its reasoning on transferred turns, which is preferable to a hard 400. |
 | **Error classification decides blame** | Punishing a key for a 413 or a dead model wastes healthy capacity. Classification picks key-, model- or provider-level action. | Message heuristics must track provider wording; all mapped cases are covered by tests. |
 
 ---
@@ -317,13 +348,14 @@ flowchart LR
 │   ├── llm.py                 # Router-backed chat models + structured_call (self-correcting)
 │   ├── resilience/            # Multi-tier, multi-key, cross-provider orchestration
 │   │   ├── providers.py       #   provider registry, tier order, model chains, key discovery
-│   │   ├── key_pool.py        #   KeyPool/KeySlot: round-robin, RPM/TPM buckets, cooldowns, health
-│   │   ├── errors.py          #   ErrorKind classification + Retry-After parsing
-│   │   └── router.py          #   ModelRouter + ResilientChatModel (LangChain facade)
+│   │   ├── key_pool.py        #   KeyPool/KeySlot: round-robin, RPM + per-model TPM buckets, cooldowns
+│   │   ├── errors.py          #   ErrorKind classification, Retry-After + error-detail parsing
+│   │   ├── adapters.py        #   per-provider payload adapters (Mistral ids, Gemini signatures)
+│   │   └── router.py          #   ModelRouter (+ sticky routing) + ResilientChatModel facade
 │   ├── prompts.py             # All system prompts
 │   ├── state.py               # ResearchState (TypedDict + reducers), checkpoint-friendly
 │   ├── nodes.py               # assess_clarity · ask_user · plan · research · evaluate · synthesize + routers
-│   ├── researcher.py          # deepagents / create_agent factory (inner ReAct engine)
+│   ├── researcher.py          # deepagents / create_agent factory + context-size middleware
 │   ├── citations.py           # Draft → grounded ResearchReport (quote verification, deep links, linking)
 │   ├── graph.py               # StateGraph wiring + checkpointer
 │   ├── runner.py              # ResearchSession async API + CLI
@@ -337,10 +369,11 @@ flowchart LR
 ├── schemas/
 │   ├── clarification.py       # ClarityAssessment, ClarificationRequest
 │   ├── planning.py            # ResearchPlan, SubQuery
-│   ├── evidence.py            # SearchResult, ScrapedPage, Evidence, EvidenceEvaluation
+│   ├── evidence.py            # SearchResult, ScrapedPage, Evidence, EvidenceEvaluation, SourceNotes
 │   ├── report.py              # SynthesisDraft, Source, ResearchReport (strict validators)
 │   └── events.py              # TraceEvent (thought/action/observation/dedup/skip/error/status)
-├── tests/                     # 66 tests: registry, deep links, scraper, schema, graph flow, key pools, router
+├── tests/                     # 91 tests: registry, deep links, scraper, schema, graph flow, key pools,
+│                              #   router, adapters, research-context middleware
 ├── .env.example · requirements.txt · pyproject.toml · .streamlit/config.toml
 ```
 
@@ -417,8 +450,10 @@ async for item in session.run("State of solid-state EV batteries in 2026"):
 ### Model & rate-limit tips
 - **Add keys before anything else.** Each extra key adds throughput, and each extra provider adds a
   failover tier. A practical free setup: 2-3 Groq keys + 1 Cerebras + 1 Gemini + 1 OpenRouter.
-- Keep `GROQ_TPM` set on the free tier. Oversized deep-agent prompts then go straight to a
-  higher-limit provider instead of failing with 413.
+- **Leave `GROQ_TPM` unset** on the free tier. Built-in per-model limits (gpt-oss-120b 8k,
+  llama-3.3-70b 12k, llama-3.1-8b 6k, qwen3-32b 6k) are more precise, and setting `GROQ_TPM`
+  applies one value to every Groq model. On paid plans use `GROQ_TPM=0` or `LLM_MODEL_TPM`.
+- On a paid Cerebras plan set `CEREBRAS_CONTEXT=0` to lift the free tier's ~8k request cap.
 - Default model ids live in `agent/resilience/providers.py`. Override them per role with
   `LLM_CHAIN_MAIN` / `LLM_CHAIN_FAST`. Unknown or decommissioned models are skipped automatically.
 - Tool calling matters most for the `main` chain (Llama 3.3 70B, gpt-oss-120b, Gemini Flash and
@@ -432,7 +467,9 @@ async for item in session.run("State of solid-state EV batteries in 2026"):
 | Variable | Default | Purpose |
 |---|---|---|
 | `<P>_API_KEY`, `<P>_API_KEY_2…`, `<P>_API_KEYS` | — | Keys per provider `P` ∈ `GROQ, CEREBRAS, MISTRAL, GEMINI, OPENROUTER, OPENAI` (unlimited) |
-| `<P>_RPM` / `<P>_TPM` | free-tier RPM; TPM off | Proactive per-key, per-model budgets (`0`/`off` disables) |
+| `<P>_RPM` / `<P>_TPM` | free-tier RPM; built-in per-model TPM | Proactive per-key budgets. `<P>_TPM` applies one value to **all** of the provider's models and overrides the built-in per-model values (`0`/`off` disables) |
+| `<P>_CONTEXT` | Cerebras ≈8,192; others none | Max tokens per request; larger requests skip the provider without a call |
+| `LLM_MODEL_TPM` / `LLM_MODEL_CONTEXT` | — | Per-model overrides, highest precedence: `provider:model=N,…` |
 | `LLM_CHAIN_MAIN` / `LLM_CHAIN_FAST` | auto (tier order) | Explicit `provider:model,…` fallback chains |
 | `LLM_MAX_WAIT_SECONDS` | `45` | Longest wait when every key is saturated |
 | `LLM_COOLDOWN_BASE_SECONDS` / `_MAX_SECONDS` | `20` / `300` | 429 backoff when there's no Retry-After |
@@ -471,8 +508,10 @@ The suite needs **no API keys and no network**:
 | `test_scraper.py` | trafilatura extraction via `httpx.MockTransport`; PDF, 404 and connection errors returned (not raised); 503 retry; truncation |
 | `test_report_schema.py` | Citation contract: bare `[n]`, unknown id, URL mismatch, confidence bounds, duplicate ids, deep-link base check |
 | `test_resilience_primitives.py` | Key parsing and masking, token buckets, round-robin, per-model cooldown scope, exponential backoff, Retry-After precedence, auth disable / quota parking, error classification for real `openai` SDK exceptions and Tavily errors, provider discovery and chain building |
-| `test_router.py` | Key rotation on 429, cross-provider failover, round-robin distribution, 413 skips the model and not the key, **proactive TPM/RPM routing**, dead-model memory, bounded waiting, exhaustion and fatal re-raise, sync path, `with_structured_output`, a real `create_agent` tool loop and a real **deepagents** run on the router, failover events reaching the LangGraph stream, Tavily key rotation |
-| `test_graph_flow.py` | **Full graph:** clarify → `interrupt` → resume → 2 iterations with query rewriting → synthesis with renumbering, hallucinated-id removal, verified deep links and contradictions. Also covers agent-failure fallback with the `max_iterations` cap, and that the real `deepagents` and `create_agent` engines compile against the installed libraries. |
+| `test_router.py` | Key rotation on 429, cross-provider failover, context-limit skips, per-model TPM routing, `max_tokens` forwarding and budgeting, provider error text in failover events, round-robin distribution, 413 skips the model and not the key, **proactive TPM/RPM routing**, dead-model memory, bounded waiting, exhaustion and fatal re-raise, sync path, `with_structured_output`, a real `create_agent` tool loop and a real **deepagents** run on the router, failover events reaching the LangGraph stream, Tavily key rotation |
+| `test_graph_flow.py` | **Full graph:** clarify → `interrupt` → resume → 2 iterations with query rewriting → synthesis with renumbering, hallucinated-id removal, verified deep links and contradictions. Also covers agent-failure fallback with the `max_iterations` cap, real `deepagents`/`create_agent` compilation, and **two-step synthesis** (key points reach the prompt, raw text doesn't, explicit `max_tokens`, extraction-failure fallback, irrelevant pages dropped). |
+| `test_adapters.py` | Mistral id rewrite (9-char, deterministic, paired), Gemini placeholder signature (real ones kept), `max_tokens` rename, router uses the right adapter, sticky routing on/off and fallback when the sticky target is busy |
+| `test_research_context.py` | Old tool results cleared and the 2 most recent kept (both engines), deep engine exposes only allow-listed tools, trimmed observations with full text kept in the registry |
 
 ---
 
@@ -570,6 +609,8 @@ can't use it. It also has no notion of keys, cooldowns, budgets or shared state 
 - Router and key-pool state (cooldowns, budgets) lives in process memory. Multiple app replicas would
   each keep their own view; a shared Redis-backed pool is the fix.
 - Token budgets use an approximate count (chars/4), so TPM limits are respected approximately, not exactly.
+- Built-in per-model TPM and context values are free-tier defaults and may drift as providers change limits.
+- The Mistral tool-call-id adapter is unit-tested but not yet verified live (the test account's quota was exhausted).
 
 **Roadmap**
 - [ ] Redis-backed key pools so cooldowns and budgets are shared across replicas
@@ -578,5 +619,25 @@ can't use it. It also has no notion of keys, cooldowns, budgets or shared state 
 - [ ] Persistent checkpointer (SQLite/Postgres) and a conversation history sidebar
 - [ ] Source credibility scoring (domain allow and deny lists, publication date freshness)
 - [ ] Token-level streaming of the final report
-- [ ] LangSmith tracing and an offline evaluation harness
+- [ ] Evaluation harness + golden dataset, then post-retrieval RAG ([#7](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/7))
+- [ ] LangSmith or Logfire tracing (traces are currently in-memory only)
 - [ ] FastAPI + SSE backend so the agent can serve non-Streamlit clients
+
+---
+
+## 14. Development history
+
+Every change after the initial version went through a GitHub issue (problem, evidence, root cause,
+decision) and a PR (what changed, why, tests). The first live run showed calls growing to 8–12k
+tokens and a failover cascade that ended on a single OpenRouter key; these fixes came out of
+diagnosing it.
+
+| Issue | Problem found | Fix (PR) |
+|---|---|---|
+| [#1](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/1) | ReAct history resent every tool result (8–12k-token calls) | Clear old tool results with `ContextEditingMiddleware` ([#8](https://github.com/YashMittal1503/ReAct-Search-Agent/pull/8)) |
+| [#2](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/2) | Unused deepagents tools cost ~2.1k tokens per call | Tool allowlist + trimmed observations ([#9](https://github.com/YashMittal1503/ReAct-Search-Agent/pull/9)) |
+| [#6](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/6) | Failover trace hid the providers' error messages | Error detail in failover events ([#10](https://github.com/YashMittal1503/ReAct-Search-Agent/pull/10)) |
+| [#4](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/4) | Gemini 400 (missing thought signature) and Mistral 422 on mixed-provider history | Payload adapters + sticky routing ([#11](https://github.com/YashMittal1503/ReAct-Search-Agent/pull/11)) |
+| [#5](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/5) | Limits per provider, not per model; no context-window awareness | Per-model TPM + context limits ([#12](https://github.com/YashMittal1503/ReAct-Search-Agent/pull/12)) |
+| [#3](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/3) | ~7.5k-token synthesis prompt; flat 800-token estimate | Two-step synthesis + explicit `max_tokens` ([#13](https://github.com/YashMittal1503/ReAct-Search-Agent/pull/13)) |
+| [#7](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/7) | Irrelevant text in retrieved pages | *Open:* evaluation harness first, then RAG |
