@@ -1,0 +1,28 @@
+[project]
+name = "deep-research-react-agent"
+version = "1.0.0"
+description = "Asynchronous Deep Research ReAct agent (LangGraph + deepagents) with ambiguity detection, deduplicated two-tier retrieval, reflection and deep-link citations."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=1.0",
+    "langchain>=1.0",
+    "langchain-core>=1.0",
+    "langchain-openai>=1.0",
+    "deepagents>=0.2",
+    "tavily-python>=0.5",
+    "httpx>=0.27",
+    "trafilatura>=2.0",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "python-dotenv>=1.0",
+    "streamlit>=1.40",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+asyncio_default_fixture_loop_scope = "function"

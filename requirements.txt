@@ -1,0 +1,23 @@
+# --- Orchestration ---------------------------------------------------------
+langgraph>=1.0
+langchain>=1.0
+langchain-core>=1.0
+langchain-openai>=1.0          # OpenAI-compatible client (Groq, OpenRouter, Ollama, vLLM, ...)
+deepagents>=0.2                # Deep-agent harness (planning, sub-agents, ReAct tool loop)
+
+# --- Retrieval ---------------------------------------------------------------
+tavily-python>=0.5
+httpx>=0.27
+trafilatura>=2.0
+
+# --- Validation / config -----------------------------------------------------
+pydantic>=2.7
+pydantic-settings>=2.3
+python-dotenv>=1.0
+
+# --- Frontend ----------------------------------------------------------------
+streamlit>=1.40
+
+# --- Dev ---------------------------------------------------------------------
+pytest>=8.0
+pytest-asyncio>=0.24
