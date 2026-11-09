@@ -196,3 +196,41 @@ def test_error_detail_extraction(body: object, expected: str) -> None:
 
     assert error_detail(_with_body(400, body)) == expected
     assert classify_error(_with_body(400, body)).detail == expected
+
+
+# ---------------------------------------------------------------------------
+# Per-model TPM and context limits (#5)
+# ---------------------------------------------------------------------------
+def test_per_model_tpm_precedence() -> None:
+    # Built-in Groq free-tier values apply per model when GROQ_TPM is not set.
+    groq = load_provider_configs({"GROQ_API_KEY": "g"})["groq"]
+    assert groq.tpm_for("llama-3.3-70b-versatile") == 12_000
+    assert groq.tpm_for("openai/gpt-oss-120b") == 8_000
+    assert groq.tpm_for("some-new-model") is None  # unknown model: provider default (none)
+
+    # An explicit provider-wide GROQ_TPM overrides the built-ins for every model…
+    groq = load_provider_configs({"GROQ_API_KEY": "g", "GROQ_TPM": "8000"})["groq"]
+    assert groq.tpm_for("llama-3.3-70b-versatile") == 8_000
+    # …and a per-model override beats everything.
+    env = {"GROQ_API_KEY": "g", "GROQ_TPM": "8000", "LLM_MODEL_TPM": "groq:llama-3.3-70b-versatile=30000"}
+    groq = load_provider_configs(env)["groq"]
+    assert groq.tpm_for("llama-3.3-70b-versatile") == 30_000 and groq.tpm_for("openai/gpt-oss-120b") == 8_000
+
+
+def test_context_limits_and_keyslot_uses_model_tpm() -> None:
+    env = {"CEREBRAS_API_KEY": "c", "MISTRAL_API_KEY": "m", "LLM_MODEL_CONTEXT": "mistral:tiny=4000"}
+    configs = load_provider_configs(env)
+    assert configs["cerebras"].context_for("gpt-oss-120b") == 8_192  # free-tier default
+    assert configs["mistral"].context_for("tiny") == 4_000 and configs["mistral"].context_for("other") is None
+    assert load_provider_configs({"CEREBRAS_API_KEY": "c", "CEREBRAS_CONTEXT": "0"})["cerebras"].context is None
+
+    pool = KeyPool("groq", ["k"], tpm=None, model_tpm={"small": 6_000, "big": 12_000})
+    slot = pool.slots[0]
+    assert not slot.can_ever_fit("small", 10_000) and slot.can_ever_fit("big", 10_000) and slot.can_ever_fit("x", 10**6)
+
+
+def test_parse_model_limits_validation() -> None:
+    from agent.resilience.providers import parse_model_limits
+
+    with pytest.raises(ValueError):
+        parse_model_limits("groq-without-model=5")

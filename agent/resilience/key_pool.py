@@ -133,6 +133,8 @@ class KeySlot:
     key: str
     rpm: float | None = None
     tpm: float | None = None
+    model_tpm: dict[str, float | None] = field(default_factory=dict)
+    """Per-scope (model) TPM overrides; falls back to ``tpm``."""
     masked: str = ""
     disabled_reason: str | None = None
     cooldowns: dict[str, float] = field(default_factory=dict)
@@ -153,7 +155,8 @@ class KeySlot:
         if scope not in self.limits:
             # RPM bucket allows a small burst (~10s worth); TPM bucket allows a full minute.
             burst = max(1.0, math.ceil((self.rpm or 0) / 6)) if self.rpm else None
-            self.limits[scope] = ScopeLimits(rpm=TokenBucket(self.rpm, burst), tpm=TokenBucket(self.tpm))
+            tpm = self.model_tpm[scope] if scope in self.model_tpm else self.tpm
+            self.limits[scope] = ScopeLimits(rpm=TokenBucket(self.rpm, burst), tpm=TokenBucket(tpm))
         return self.limits[scope]
 
     def cooldown_remaining(self, scope: str) -> float:
@@ -209,13 +212,14 @@ class KeyPool:
         *,
         rpm: float | None = None,
         tpm: float | None = None,
+        model_tpm: dict[str, float | None] | None = None,
         cooldown_base: float = 20.0,
         cooldown_max: float = 300.0,
         quota_cooldown: float = 3600.0,
         transient_cooldown: float = 5.0,
     ) -> None:
         self.provider = provider
-        self.slots = [KeySlot(key=k, rpm=rpm, tpm=tpm) for k in keys if k]
+        self.slots = [KeySlot(key=k, rpm=rpm, tpm=tpm, model_tpm=dict(model_tpm or {})) for k in keys if k]
         self.cooldown_base = cooldown_base
         self.cooldown_max = cooldown_max
         self.quota_cooldown = quota_cooldown
