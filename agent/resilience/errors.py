@@ -50,10 +50,43 @@ class ClassifiedError:
     message: str
     status: int | None = None
     retry_after: float | None = None
+    detail: str = ""
+    """The provider's own human-readable error message (from the response body), if any."""
 
     @property
     def recoverable(self) -> bool:
         return self.kind is not ErrorKind.FATAL
+
+
+_STATUS_PREFIX_RE = re.compile(r"^error code:\s*\d+\s*-?\s*", re.I)
+
+
+def error_detail(exc: BaseException) -> str:
+    """Extract the provider's error message from an SDK exception.
+
+    Handles OpenAI-style ``{"error": {"message": ...}}`` bodies, Gemini's list-wrapped variant
+    ``[{"error": {...}}]``, Mistral's flat ``{"message": ...}`` and plain strings; falls back to
+    ``str(exc)`` without the ``Error code: NNN -`` prefix.
+
+    >>> error_detail(type("E", (Exception,), {"body": [{"error": {"message": "missing  sig"}}]})())
+    'missing sig'
+    """
+    body: Any = getattr(exc, "body", None)
+    if isinstance(body, list) and body:
+        body = body[0]
+    text = ""
+    if isinstance(body, dict):
+        err = body.get("error", body)
+        if isinstance(err, dict):
+            text = str(err.get("message") or err.get("detail") or "")
+        elif isinstance(err, str):
+            text = err
+        text = text or str(body.get("message") or body.get("detail") or "")
+    elif isinstance(body, str):
+        text = body
+    if not text:
+        text = _STATUS_PREFIX_RE.sub("", str(exc))
+    return " ".join(text.split())
 
 
 _DURATION_RE = re.compile(r"(?:(\d+(?:\.\d+)?)h)?(?:(\d+(?:\.\d+)?)m(?!s))?(?:(\d+(?:\.\d+)?)s)?(?:(\d+(?:\.\d+)?)ms)?$")
@@ -138,7 +171,8 @@ def classify_error(exc: BaseException) -> ClassifiedError:
     message = str(exc) or name
 
     def make(kind: ErrorKind, retry: bool = False) -> ClassifiedError:
-        return ClassifiedError(kind, message, status, extract_retry_after(exc) if retry else None)
+        return ClassifiedError(kind, message, status, extract_retry_after(exc) if retry else None,
+                               detail=error_detail(exc))
 
     # --- Tavily SDK exceptions (no status code attached) ----------------------------------
     if name in {"UsageLimitExceededError", "TavilyKeylessLimitError"}:

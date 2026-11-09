@@ -311,3 +311,16 @@ async def test_tavily_rotates_keys_on_rate_limit() -> None:
     assert outcome.error is None and outcome.results[0].url == "https://a.com"
     assert calls == ["t1", "t2"]
     assert searcher.pool.slots[0].status().startswith("cooling")
+
+
+async def test_failover_event_includes_provider_error_detail() -> None:
+    script = Script()
+    router = make_router(script)
+    response = httpx.Response(400, request=httpx.Request("POST", "https://api.test/v1"))
+    script.outcomes[("groq", "llama")] = [openai.BadRequestError(
+        "Error code: 400", response=response, body=[{"error": {"message": "Function call is missing a thought_signature"}}])]
+    events: list[RouterEvent] = []
+    with router_events(events.append):
+        await router.agenerate("main", MSGS)
+    assert events[0].message.endswith("trying another provider — Function call is missing a thought_signature")
+    assert events[0].data["detail"].startswith("Function call is missing")
