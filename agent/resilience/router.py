@@ -154,8 +154,8 @@ class ModelRouter:
     ) -> None:
         self.providers = dict(providers)
         self.pools: dict[str, KeyPool] = {
-            name: KeyPool(name, cfg.keys, rpm=cfg.rpm, tpm=cfg.tpm, cooldown_base=cooldown_base,
-                          cooldown_max=cooldown_max)
+            name: KeyPool(name, cfg.keys, rpm=cfg.rpm, tpm=cfg.tpm, model_tpm=cfg.model_tpm,
+                          cooldown_base=cooldown_base, cooldown_max=cooldown_max)
             for name, cfg in self.providers.items()
         }
         self.chains: dict[str, list[ModelTarget]] = {}
@@ -259,6 +259,14 @@ class ModelRouter:
         if preferred in live:  # sticky routing: try the last successful target first
             live = [preferred, *(t for t in live if t != preferred)]
         tried: set[tuple[ModelTarget, str]] = set()
+
+        # Context windows: skip targets that can never accept a request this large (no wasted call).
+        for target in live:
+            limit = self.providers[target.provider].context_for(target.model)
+            if limit and tokens > limit and target not in skip:
+                skip.add(target)
+                self._emit("failover", f"~{tokens:,} tokens exceeds {target.label}'s {limit:,}-token request limit "
+                                       f"→ skipping", model=target.label)
 
         # Pass 1: anything that can be sent *right now*, in tier order, keys round-robin.
         for target in live:
@@ -421,7 +429,8 @@ class ModelRouter:
                        for role, chain in self.chains.items()},
             "providers": [
                 {"name": name, "label": self.providers[name].spec.label, "rpm": self.providers[name].rpm,
-                 "tpm": self.providers[name].tpm, "keys": pool.snapshot()}
+                 "tpm": self.providers[name].tpm, "model_tpm": dict(self.providers[name].model_tpm),
+                 "context": self.providers[name].context, "keys": pool.snapshot()}
                 for name, pool in self.pools.items()
             ],
             "dead_models": {t.label: reason for t, (until, reason) in self._dead.items() if until > time.monotonic()},

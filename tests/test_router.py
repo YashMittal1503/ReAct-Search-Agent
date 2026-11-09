@@ -324,3 +324,26 @@ async def test_failover_event_includes_provider_error_detail() -> None:
         await router.agenerate("main", MSGS)
     assert events[0].message.endswith("trying another provider — Function call is missing a thought_signature")
     assert events[0].data["detail"].startswith("Function call is missing")
+
+
+async def test_context_limit_skips_target_without_calling_it() -> None:
+    script = Script()
+    env = {"CEREBRAS_API_KEY": "c1", "CEREBRAS_RPM": "0", "GEMINI_API_KEY": "ge1", "GEMINI_RPM": "0"}
+    router = make_router(script, env=env, chain=["cerebras:gpt-oss-120b", "gemini:flash"])
+    events: list[RouterEvent] = []
+    with router_events(events.append):
+        await router.agenerate("main", [HumanMessage("word " * 8_000)])  # ~10k tokens > 8,192
+    assert script.calls == [("gemini", "ge1", "flash")]
+    assert "8,192-token request limit" in events[0].message
+
+    script.calls.clear()
+    await router.agenerate("main", MSGS)  # small request still goes to cerebras
+    assert script.calls == [("cerebras", "c1", "gpt-oss-120b")]
+
+
+async def test_groq_large_request_uses_higher_tpm_model() -> None:
+    script = Script()
+    env = {"GROQ_API_KEY": "g1", "GROQ_RPM": "0"}
+    router = make_router(script, env=env, chain=["groq:openai/gpt-oss-120b", "groq:llama-3.3-70b-versatile"])
+    await router.agenerate("main", [HumanMessage("word " * 7_000)])  # ~9.5k: over 8k, under 12k
+    assert script.calls == [("groq", "g1", "llama-3.3-70b-versatile")]

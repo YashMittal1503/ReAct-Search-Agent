@@ -286,8 +286,12 @@ def render_provider_health(router: ModelRouter, search_pool: KeyPool) -> None:
     with st.expander("Keys & limits", expanded=False):
         dot = {"ready": "🟢", "disabled": "🔴"}
         for prov in health["providers"]:
-            limits = ", ".join(f"{n.upper()} {int(v)}" for n, v in (("rpm", prov["rpm"]), ("tpm", prov["tpm"])) if v)
+            limits = ", ".join(f"{n.upper()} {int(v):,}" for n, v in (("rpm", prov["rpm"]), ("tpm", prov["tpm"]),
+                                                                      ("ctx", prov.get("context"))) if v)
+            per_model = ", ".join(f"`{m}` {int(v):,}" if v else f"`{m}` ∞" for m, v in prov.get("model_tpm", {}).items())
             st.markdown(f"**{prov['label']}** · {len(prov['keys'])} key(s){' · ' + limits if limits else ''}")
+            if per_model:
+                st.caption(f"TPM per model: {per_model}")
             for k in prov["keys"]:
                 icon = dot.get(k["status"], "🟡")
                 st.markdown(f"{icon} `{k['key']}` {k['status']} · {k['ok']}/{k['calls']} ok · {k['rate_limited']} × 429")
