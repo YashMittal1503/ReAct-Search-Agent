@@ -83,3 +83,14 @@ Report structure:
 - If sources conflict, say so explicitly in the text and list it in `contradictions_noted`.
 - If evidence is thin for some aspect, say so rather than inventing facts.
 - confidence_score: your honest confidence (0-1) that the report is accurate and complete."""
+
+EXTRACTOR_SYSTEM = """You extract evidence for a research report from ONE source document.
+Given the research question and the source text, return the 2-5 points from this source that matter
+most for answering the question: facts, numbers, findings, expert positions and caveats.
+
+Rules:
+- Each key point has a one-sentence claim and a VERBATIM quote (8-40 words) copied exactly from the
+  source text; never paraphrase inside the quote.
+- Prefer specific, checkable information (numbers, dates, named studies) over generic statements.
+- Keep points that disagree with other common views; they matter for contradictions.
+- If the source has nothing relevant to the question, set relevant=false and return no points."""
