@@ -24,7 +24,7 @@ Emitter = Callable[[TraceEvent], None]
 
 #: Max characters of a scraped page returned to the LLM as the observation. The full text is
 #: kept in the registry for the evaluator and synthesizer; this keeps the ReAct context small.
-OBSERVATION_PREVIEW_CHARS = 2_500
+OBSERVATION_PREVIEW_CHARS = 1_200
 
 
 @dataclass
@@ -86,7 +86,7 @@ def make_research_tools(
                 new_count += 1
                 stored = registry.results[normalize_url(r.url)]
                 lines.append(
-                    f"- [{stored.score:.2f}] {stored.title}\n  URL: {stored.url}\n  Snippet: {stored.snippet[:350]}"
+                    f"- [{stored.score:.2f}] {stored.title}\n  URL: {stored.url}\n  Snippet: {stored.snippet[:200]}"
                 )
             if lines[-1].startswith("\n### Query"):
                 lines.append("(no new results — all duplicates)")
