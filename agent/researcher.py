@@ -7,24 +7,32 @@ messages out), so swapping them is a config flag (``RESEARCH_ENGINE``):
   with a ``task`` tool that delegates each sub-question to an isolated **source-reader sub-agent**.
 * ``react`` — :func:`langchain.agents.create_agent`: a minimal tool-calling ReAct loop.
 
-Context-size control (applied to both engines and to sub-agents): LangChain's
-:class:`ContextEditingMiddleware` + :class:`ClearToolUsesEdit` replace older tool results with a short
-placeholder once the conversation grows past a token threshold. The full data is already stored in
-the :class:`~tools.url_registry.URLRegistry`, so the agent loses nothing it needs, but each ReAct turn
-stops resending every previous search result.
+Context-size control (applied to both engines and to sub-agents):
+
+* :class:`ToolAllowlistMiddleware` hides deepagents' built-in virtual-filesystem tools (``ls``,
+  ``read_file``, ``grep``, …). This workflow never uses them, yet their JSON schemas cost ~2.1k
+  tokens on *every* model call.
+* LangChain's :class:`ContextEditingMiddleware` + :class:`ClearToolUsesEdit` replace older tool
+  results with a short placeholder once the conversation grows past a token threshold. The full data
+  is already stored in the :class:`~tools.url_registry.URLRegistry`, so the agent loses nothing it
+  needs, but each ReAct turn stops resending every previous search result.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import Literal
+from collections.abc import Awaitable, Callable, Sequence
+from typing import Any, Literal
 
 from langchain.agents.middleware import AgentMiddleware, ClearToolUsesEdit, ContextEditingMiddleware
+from langchain.agents.middleware.types import ModelRequest, ModelResponse
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
 from langgraph.graph.state import CompiledStateGraph
 
 from agent.prompts import RESEARCHER_SYSTEM, SOURCE_READER_DESCRIPTION, SOURCE_READER_SYSTEM
+
+#: Tools the research workflow actually uses. Everything else injected by a harness is hidden.
+ALLOWED_TOOLS = frozenset({"search_web", "scrape_page", "task", "write_todos"})
 
 #: Start clearing old tool results once the conversation exceeds this many (approx.) tokens…
 CLEAR_TOOL_RESULTS_TRIGGER = 3_500
@@ -36,9 +44,34 @@ CLEARED_PLACEHOLDER = (
 )
 
 
+def _tool_name(tool: Any) -> str:
+    if isinstance(tool, dict):
+        return tool.get("name") or tool.get("function", {}).get("name", "")
+    return getattr(tool, "name", "")
+
+
+class ToolAllowlistMiddleware(AgentMiddleware):
+    """Expose only an allow-listed set of tools to the model (hides unused harness tools)."""
+
+    def __init__(self, allowed: frozenset[str] = ALLOWED_TOOLS) -> None:
+        super().__init__()
+        self.allowed = allowed
+
+    def _filter(self, request: ModelRequest) -> ModelRequest:
+        return request.override(tools=[t for t in request.tools if _tool_name(t) in self.allowed])
+
+    def wrap_model_call(self, request: ModelRequest, handler: Callable[[ModelRequest], ModelResponse]) -> ModelResponse:
+        return handler(self._filter(request))
+
+    async def awrap_model_call(self, request: ModelRequest,
+                               handler: Callable[[ModelRequest], Awaitable[ModelResponse]]) -> ModelResponse:
+        return await handler(self._filter(request))
+
+
 def context_middleware() -> list[AgentMiddleware]:
     """Middleware stack that keeps every model call small (fresh instances per agent)."""
     return [
+        ToolAllowlistMiddleware(),
         ContextEditingMiddleware(edits=[ClearToolUsesEdit(
             trigger=CLEAR_TOOL_RESULTS_TRIGGER,
             keep=KEEP_RECENT_TOOL_RESULTS,
