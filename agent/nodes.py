@@ -481,13 +481,17 @@ class ResearchNodes:
             )
             return {"report": report.model_dump()}
 
-        # Step 1: distil each scraped page into key points with verbatim quotes (fast chain, parallel).
-        notes = await self._extract_notes(question, evidence)
-        evidence = [ev for ev, _ in notes]  # irrelevant sources dropped; numbering follows this list
-        digest = "\n\n---\n\n".join(
-            f"[{i}] {ev.title} — {ev.domain} (relevance {ev.score:.2f})\n{body}"
-            for i, (ev, body) in enumerate(notes, start=1)
-        )
+        if self.s.synthesis_mode == "single_step":
+            # Legacy path (kept for A/B evaluation): raw first-N-char excerpts of every source.
+            digest = _evidence_digest(evidence, per_item=2_500, budget=30_000)
+        else:
+            # Step 1: distil each scraped page into key points with verbatim quotes (fast chain, parallel).
+            notes = await self._extract_notes(question, evidence)
+            evidence = [ev for ev, _ in notes]  # irrelevant sources dropped; numbering follows this list
+            digest = "\n\n---\n\n".join(
+                f"[{i}] {ev.title} — {ev.domain} (relevance {ev.score:.2f})\n{body}"
+                for i, (ev, body) in enumerate(notes, start=1)
+            )
         emit("observation", "synthesize",
              f"Synthesis prompt: {len(evidence)} sources, ≈{len(digest) // 4:,} tokens of evidence")
 

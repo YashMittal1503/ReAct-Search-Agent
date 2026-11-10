@@ -51,6 +51,7 @@ Clarify ──► Plan ──► Search ──► Selective Scrape ──► Eva
 | **Streamlit UI** | Chat interface, live `st.status("Researching...")` trace (including deduplicated URLs and skipped scrapes), a metrics row, the report, a contradictions panel, and **Verified Sources** cards with deep links, domain badges and exact quotes. You can also download the report as `.md`. |
 | **Rate-limit-proof LLM layer** | Multi-tier cross-provider failover with **multi-key pools** (unlimited keys per provider, round-robin), proactive **per-model** RPM/TPM budgets and context limits, Retry-After-aware cooldowns, error-aware blame (key vs model vs provider), per-provider request adapters and sticky routing. Exposed as one LangChain chat model, so deepagents and structured output use it unchanged. See [§4](#4-resilient-multi-provider-orchestration--multi-key-pools). |
 | **Observability** | Rotating JSON-lines app log, per-attempt LLM telemetry, one record file per run plus a cross-run index with quality and cost metrics, and opt-in **LangSmith** tracing (run tree, threads, evaluation feedback). See [§5](#5-observability-logs-run-records--langsmith). |
+| **Evaluation harness** | 25-question golden dataset with 115 nuggets, LLM-judged nugget recall and citation precision, frozen-evidence replay for fair A/B tests, bootstrap confidence intervals and an automated ship rule. See [`evals/`](evals/README.md). |
 | **Provider-agnostic** | Any OpenAI-compatible endpoint (Groq, Cerebras, Mistral, Gemini, OpenRouter, OpenAI, vLLM, Ollama). Adding a tier means adding a key to `.env`. |
 
 ---
@@ -425,6 +426,7 @@ calls, and a LangSmith outage never affects a research run.
 │   ├── evidence.py            # SearchResult, ScrapedPage, Evidence, EvidenceEvaluation, SourceNotes
 │   ├── report.py              # SynthesisDraft, Source, ResearchReport (strict validators)
 │   └── events.py              # TraceEvent (thought/action/observation/dedup/skip/error/status)
+├── evals/                     # golden dataset, judge, metrics, snapshot/replay/e2e runner, compare
 ├── tests/                     # 104 tests: registry, deep links, scraper, schema, graph flow, key pools,
 │                              #   router, adapters, research-context middleware, observability, tracing
 ├── .env.example · requirements.txt · pyproject.toml · .streamlit/config.toml
@@ -541,6 +543,7 @@ async for item in session.run("State of solid-state EV batteries in 2026"):
 | `SCRAPE_TIMEOUT_SECONDS` / `SCRAPE_MAX_CHARS` | `15` / `12000` | Fetch timeout and stored text cap |
 | `LOG_DIR` / `LOG_LEVEL` / `RUN_LOGS` | `logs` / `INFO` / `true` | App log, run files and run index location; run recording on/off |
 | `LANGSMITH_API_KEY` / `LANGSMITH_PROJECT` | — / `deep-research-agent` | Enables LangSmith tracing + feedback (`LANGSMITH_TRACING=false` turns it off) |
+| `SYNTHESIS_MODE` | `two_step` | `two_step` (key points, then report) or `single_step` (legacy raw excerpts; for evaluation) |
 | `MAX_REPORT_SOURCES` | `12` | Evidence items shown to the synthesizer |
 
 ---
@@ -569,6 +572,24 @@ The suite needs **no API keys and no network**:
 | `test_tracing.py` | Tracing off without a key / on with one (env export), root-run config, attempts as named child runs (real callback tree, failed attempt marked as error), node runs parented to the root run, feedback and run URL with a fake client |
 | `test_adapters.py` | Mistral id rewrite (9-char, deterministic, paired), Gemini placeholder signature (real ones kept), `max_tokens` rename, router uses the right adapter, sticky routing on/off and fallback when the sticky target is busy |
 | `test_research_context.py` | Old tool results cleared and the 2 most recent kept (both engines), deep engine exposes only allow-listed tools, trimmed observations with full text kept in the registry |
+
+---
+
+### Evaluation harness (quality, not just correctness)
+Unit tests prove the code does what it says; the harness in [`evals/`](evals/README.md) measures
+**how good the answers are**:
+- **Golden set:** 25 questions with 115 nuggets, including two ambiguous prompts that test the
+  clarification gate.
+- **Modes:** `snapshot` freezes retrieved evidence once; `replay --variant X` re-runs only synthesis on
+  that evidence (a fair A/B test); `e2e` runs everything.
+- **Metrics:** nugget recall, citation precision (both LLM-judged with audit trails), verified-quote
+  ratio, gate accuracy, tokens and latency, with 95% bootstrap confidence intervals.
+- **`python -m evals.compare A B`** applies the ship rule: quality drop ≤ 2 points and ≥ 20% fewer input
+  tokens. Results within noise are reported as **INCONCLUSIVE**.
+
+Variants include `single_step` (the pre-#3 synthesis), so the two-step decision can be re-checked on
+real data. Post-retrieval RAG ([#19](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/19)) is developed on the `experiment/rag` branch and
+judged with this harness before any merge.
 
 ---
 
@@ -676,7 +697,9 @@ can't use it. It also has no notion of keys, cooldowns, budgets or shared state 
 - [ ] Persistent checkpointer (SQLite/Postgres) and a conversation history sidebar
 - [ ] Source credibility scoring (domain allow and deny lists, publication date freshness)
 - [ ] Token-level streaming of the final report
-- [ ] Evaluation harness + golden dataset, then post-retrieval RAG ([#7](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/7))
+- [x] Evaluation harness + golden dataset ([#7](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/7))
+- [ ] Post-retrieval RAG experiment on `experiment/rag`, merged only if it passes the ship rule ([#19](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/19))
+- [ ] Human review of the golden nuggets (all marked `reviewed: false`)
 - [x] Persistent logs, run records and LangSmith tracing ([#15](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/15), [#16](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/16))
 - [ ] FastAPI + SSE backend so the agent can serve non-Streamlit clients
 
@@ -699,4 +722,5 @@ diagnosing it.
 | [#3](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/3) | ~7.5k-token synthesis prompt; flat 800-token estimate | Two-step synthesis + explicit `max_tokens` ([#13](https://github.com/YashMittal1503/ReAct-Search-Agent/pull/13)) |
 | [#15](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/15) | Logs went nowhere; trace events lost on refresh; no per-call LLM telemetry | Persistent logs + run records ([#17](https://github.com/YashMittal1503/ReAct-Search-Agent/pull/17)) |
 | [#16](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/16) | No hosted tracing or evaluation signal | LangSmith tracing + feedback (this PR) |
-| [#7](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/7) | Irrelevant text in retrieved pages | *Open:* evaluation harness first, then RAG |
+| [#7](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/7) | No way to measure answer quality or compare pipeline changes | Evaluation harness + golden dataset (this PR) |
+| [#19](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/19) | Irrelevant text in retrieved pages | *Open:* post-retrieval RAG on the `experiment/rag` branch |
