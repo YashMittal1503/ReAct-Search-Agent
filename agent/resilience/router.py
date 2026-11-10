@@ -34,7 +34,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 
-from langchain_core.callbacks import AsyncCallbackManagerForLLMRun, CallbackManagerForLLMRun
+from langchain_core.callbacks import AsyncCallbackManagerForLLMRun, CallbackManager, CallbackManagerForLLMRun
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.messages.utils import count_tokens_approximately
@@ -43,6 +43,7 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import ConfigDict, Field
 
 from agent.observability.telemetry import LLMCallRecord, record_llm_call
+from agent.observability.tracing import attempt_config
 from agent.resilience.errors import ErrorKind, classify_error
 from agent.resilience.key_pool import KeyPool, KeySlot
 from agent.resilience.providers import (
@@ -388,7 +389,7 @@ class ModelRouter:
 
     # ------------------------------------------------------------------ execution
     async def agenerate(self, role: str, messages: list[BaseMessage], stop: list[str] | None = None,
-                        **kwargs: Any) -> ChatResult:
+                        *, callbacks: Any = None, **kwargs: Any) -> ChatResult:
         """Async call with key rotation and cross-provider failover."""
         kwargs.pop("ls_structured_output_format", None)
         tokens = estimate_tokens(messages, kwargs.get("tools"),
@@ -407,7 +408,10 @@ class ModelRouter:
             attempt += 1
             started = time.monotonic()
             try:
-                message = await self._client(target, slot).ainvoke(messages, stop=stop, **kwargs)
+                message = await self._client(target, slot).ainvoke(
+                    messages, config=attempt_config(role=role, provider=target.provider, model=target.model,
+                                                    key=slot.masked, attempt=attempt, callbacks=callbacks),
+                    stop=stop, **kwargs)
             except Exception as exc:  # noqa: BLE001 - classified below
                 last = exc
                 self._record(role, target, slot, attempt, started, tokens, error=exc)
@@ -421,7 +425,7 @@ class ModelRouter:
         raise self._exhausted(role, last) from last
 
     def generate(self, role: str, messages: list[BaseMessage], stop: list[str] | None = None,
-                 **kwargs: Any) -> ChatResult:
+                 *, callbacks: Any = None, **kwargs: Any) -> ChatResult:
         """Synchronous twin of :meth:`agenerate`."""
         kwargs.pop("ls_structured_output_format", None)
         tokens = estimate_tokens(messages, kwargs.get("tools"),
@@ -440,7 +444,10 @@ class ModelRouter:
             attempt += 1
             started = time.monotonic()
             try:
-                message = self._client(target, slot).invoke(messages, stop=stop, **kwargs)
+                message = self._client(target, slot).invoke(
+                    messages, config=attempt_config(role=role, provider=target.provider, model=target.model,
+                                                    key=slot.masked, attempt=attempt, callbacks=callbacks),
+                    stop=stop, **kwargs)
             except Exception as exc:  # noqa: BLE001 - classified below
                 last = exc
                 self._record(role, target, slot, attempt, started, tokens, error=exc)
@@ -474,6 +481,22 @@ class ModelRouter:
 # ---------------------------------------------------------------------------
 # LangChain facade
 # ---------------------------------------------------------------------------
+def _child_callbacks(run_manager: Any) -> CallbackManager | None:
+    """Callback manager for runs nested under ``run_manager``'s LLM run.
+
+    LLM run managers have no ``get_child()`` (only chain run managers do), so this mirrors its
+    implementation: inherit handlers, tags and metadata, and set the parent run id. Router attempts
+    then show up as children of the ``ResilientChatModel`` run in LangSmith.
+    """
+    if run_manager is None:
+        return None
+    manager = CallbackManager(handlers=[], parent_run_id=run_manager.run_id)
+    manager.set_handlers(run_manager.inheritable_handlers)
+    manager.add_tags(run_manager.inheritable_tags)
+    manager.add_metadata(run_manager.inheritable_metadata)
+    return manager
+
+
 def _normalize_tool_choice(tool_choice: Any, formatted: list[dict[str, Any]]) -> Any:
     """Translate LangChain tool_choice conventions into the OpenAI wire format."""
     if tool_choice is None or tool_choice is False:
@@ -525,8 +548,12 @@ class ResilientChatModel(BaseChatModel):
 
     async def _agenerate(self, messages: list[BaseMessage], stop: list[str] | None = None,
                          run_manager: AsyncCallbackManagerForLLMRun | None = None, **kwargs: Any) -> ChatResult:
-        return await self.router.agenerate(self.role, messages, stop=stop, **self._with_cap(kwargs))
+        return await self.router.agenerate(self.role, messages, stop=stop,
+                                           callbacks=_child_callbacks(run_manager),
+                                           **self._with_cap(kwargs))
 
     def _generate(self, messages: list[BaseMessage], stop: list[str] | None = None,
                   run_manager: CallbackManagerForLLMRun | None = None, **kwargs: Any) -> ChatResult:
-        return self.router.generate(self.role, messages, stop=stop, **self._with_cap(kwargs))
+        return self.router.generate(self.role, messages, stop=stop,
+                                    callbacks=_child_callbacks(run_manager),
+                                    **self._with_cap(kwargs))

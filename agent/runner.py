@@ -25,6 +25,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 
 from agent.observability import RunRecorder, collect_llm_calls, log_context, summarize_calls
+from agent.observability.tracing import run_config, submit_feedback_in_background, trace_url, tracing_config
 from agent.state import initial_state
 from schemas.clarification import ClarificationRequest
 from schemas.events import TraceEvent
@@ -46,6 +47,7 @@ class RunResult:
     llm: dict[str, Any] = field(default_factory=dict)  # summarize_calls(): calls, tokens, per-model breakdown
     duration_s: float = 0.0
     log_file: str = ""
+    trace_url: str = ""  # LangSmith link (when tracing is enabled)
 
 
 def report_summary(result: RunResult) -> dict[str, Any]:
@@ -102,9 +104,13 @@ class ResearchSession:
         run_id = str(uuid.uuid4())
         resuming = await self.is_waiting_for_user()
         graph_input: Any = Command(resume={"answer": message}) if resuming else initial_state(message)
+        run_meta = {"resume": resuming, **self.metadata}
+        tracing_on = tracing_config().enabled
         handle = (self.recorder.start(run_id, thread_id=self.thread_id, query=message,
-                                      metadata={"resume": resuming, **self.metadata})
+                                      metadata={**run_meta, "langsmith": tracing_on})
                   if self.recorder else None)
+        # Root run for LangSmith: same id as the local run, thread metadata, tags.
+        config = {**self.config, **run_config(run_id, thread_id=self.thread_id, query=message, metadata=run_meta)}
         started = time.monotonic()
         status: str = "error"
         summary: dict[str, Any] | None = None
@@ -113,7 +119,7 @@ class ResearchSession:
         with log_context(run_id=run_id, thread_id=self.thread_id), collect_llm_calls() as calls:
             logger.info("Run started (%s)", "resume" if resuming else "new request", extra={"query": message[:300]})
             try:
-                async for mode, chunk in self.graph.astream(graph_input, self.config,
+                async for mode, chunk in self.graph.astream(graph_input, config,
                                                             stream_mode=["custom", "updates"]):
                     if mode == "custom" and isinstance(chunk, dict) and "trace" in chunk:
                         event = TraceEvent.model_validate(chunk["trace"])
@@ -145,6 +151,7 @@ class ResearchSession:
                         llm=summarize_calls(list(calls)),
                         duration_s=round(time.monotonic() - started, 2),
                         log_file=str(handle.path) if handle else "",
+                        trace_url=(await _maybe_trace_url(run_id)) if tracing_on else "",
                     )
                     status, summary = "completed", report_summary(result)
                     if handle:
@@ -158,11 +165,25 @@ class ResearchSession:
                 logger.exception("Run failed")
                 raise
             finally:
+                if tracing_on:
+                    extra = {**extra, "langsmith_run_id": run_id}
                 final = handle.finish(status, calls=list(calls), report=summary, extra=extra) if handle else {}
+                if tracing_on and status == "completed":
+                    # Attach quality/cost scores to the LangSmith root run (best-effort, non-blocking).
+                    submit_feedback_in_background(
+                        run_id, final or {**(summary or {}), **summarize_calls(list(calls))})
                 logger.info("Run finished: %s in %.1fs", status, time.monotonic() - started,
                             extra={"status": status, **{k: final[k] for k in
                                                         ("llm_calls", "input_tokens", "output_tokens",
                                                          "failover_events") if k in final}})
+
+
+async def _maybe_trace_url(run_id: str) -> str:
+    """LangSmith link for the run, bounded to a few seconds (empty string on any problem)."""
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(trace_url, run_id), 5) or ""
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +199,9 @@ async def _cli(question: str) -> None:  # pragma: no cover - manual entry point
 
     settings = get_settings()
     configure_logging(settings.log_dir, settings.log_level, console=False)
+    from agent.observability.tracing import configure_tracing
+
+    configure_tracing()
     session = ResearchSession(default_graph(), recorder=RunRecorder(Path(settings.log_dir) / "runs",
                                                                     enabled=settings.run_logs))
     message = question
@@ -197,6 +221,7 @@ async def _cli(question: str) -> None:  # pragma: no cover - manual entry point
                 for s in item.report.sources:
                     print(f"[{s.id}] {s.title} — {s.deep_link_url}\n     “{s.supporting_quote}”")
                 print(f"\nconfidence={item.report.confidence_score} iterations={item.iterations} stats={item.stats}")
+                print(f"run log: {item.log_file}" + (f"\nLangSmith: {item.trace_url}" if item.trace_url else ""))
         if not paused:
             break
 

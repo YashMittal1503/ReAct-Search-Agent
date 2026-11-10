@@ -24,16 +24,17 @@ Clarify ──► Plan ──► Search ──► Selective Scrape ──► Eva
 2. [Architecture](#2-architecture)
 3. [The pipeline, stage by stage](#3-the-pipeline-stage-by-stage)
 4. [Resilient multi-provider orchestration & multi-key pools](#4-resilient-multi-provider-orchestration--multi-key-pools)
-5. [Key engineering decisions & trade-offs](#5-key-engineering-decisions--trade-offs)
-6. [Project structure](#6-project-structure)
-7. [Data contracts (Pydantic v2)](#7-data-contracts-pydantic-v2)
-8. [Getting started](#8-getting-started)
-9. [Configuration reference](#9-configuration-reference)
-10. [Testing](#10-testing)
-11. [Walkthrough of a single request](#11-walkthrough-of-a-single-request)
-12. [Interview guide: talking points & likely questions](#12-interview-guide-talking-points--likely-questions)
-13. [Limitations & roadmap](#13-limitations--roadmap)
-14. [Development history](#14-development-history)
+5. [Observability: logs, run records & LangSmith](#5-observability-logs-run-records--langsmith)
+6. [Key engineering decisions & trade-offs](#6-key-engineering-decisions--trade-offs)
+7. [Project structure](#7-project-structure)
+8. [Data contracts (Pydantic v2)](#8-data-contracts-pydantic-v2)
+9. [Getting started](#9-getting-started)
+10. [Configuration reference](#10-configuration-reference)
+11. [Testing](#11-testing)
+12. [Walkthrough of a single request](#12-walkthrough-of-a-single-request)
+13. [Interview guide: talking points & likely questions](#13-interview-guide-talking-points--likely-questions)
+14. [Limitations & roadmap](#14-limitations--roadmap)
+15. [Development history](#15-development-history)
 
 ---
 
@@ -49,6 +50,7 @@ Clarify ──► Plan ──► Search ──► Selective Scrape ──► Eva
 | **Grounded synthesis** | **Two-step:** the fast models first extract 2–5 key points with verbatim quotes from each scraped page (in parallel); the report is then written from those notes with `[n]` markers. **Code** checks each quote against the retrieved text, builds `#:~:text=` deep links, rewrites markers to `[[n]](url)`, and Pydantic validates the citation contract. |
 | **Streamlit UI** | Chat interface, live `st.status("Researching...")` trace (including deduplicated URLs and skipped scrapes), a metrics row, the report, a contradictions panel, and **Verified Sources** cards with deep links, domain badges and exact quotes. You can also download the report as `.md`. |
 | **Rate-limit-proof LLM layer** | Multi-tier cross-provider failover with **multi-key pools** (unlimited keys per provider, round-robin), proactive **per-model** RPM/TPM budgets and context limits, Retry-After-aware cooldowns, error-aware blame (key vs model vs provider), per-provider request adapters and sticky routing. Exposed as one LangChain chat model, so deepagents and structured output use it unchanged. See [§4](#4-resilient-multi-provider-orchestration--multi-key-pools). |
+| **Observability** | Rotating JSON-lines app log, per-attempt LLM telemetry, one record file per run plus a cross-run index with quality and cost metrics, and opt-in **LangSmith** tracing (run tree, threads, evaluation feedback). See [§5](#5-observability-logs-run-records--langsmith). |
 | **Provider-agnostic** | Any OpenAI-compatible endpoint (Groq, Cerebras, Mistral, Gemini, OpenRouter, OpenAI, vLLM, Ollama). Adding a tier means adding a key to `.env`. |
 
 ---
@@ -314,7 +316,57 @@ flowchart LR
 
 ---
 
-## 5. Key engineering decisions & trade-offs
+## 5. Observability: logs, run records & LangSmith
+
+Three layers, from always-on local files to hosted tracing. They share **one `run_id` per research
+run**, so a line in the app log, a run file and a LangSmith trace can be matched exactly.
+
+| Layer | Where | What you get |
+|---|---|---|
+| **App log** | `logs/app.jsonl` (rotating, 5 MB × 5) | Structured JSON lines from every module, tagged with `run_id` / `thread_id`: router failovers, key cooldowns, scrape failures, run start/finish |
+| **LLM call telemetry** | `llm.calls` logger + run files | One record per **router attempt**: role, provider, model, masked key, outcome (`ok` or error kind), latency, estimated vs actual input/output tokens |
+| **Run records** | `logs/runs/<date>/<run_id>.jsonl` + `logs/runs/index.jsonl` | Per run: query, engine, chains, every trace event, clarifications, the full report and all LLM calls. The index has one summary line per run with quality and cost metrics |
+| **LangSmith** (opt-in) | smith.langchain.com, project `deep-research-agent` | Full run tree, threads, per-attempt child runs, and evaluation feedback scores |
+
+### 5.1 The run index, for evaluation
+Each completed run appends a line like this (abridged, illustrative values):
+```json
+{"run_id": "3f2c…", "thread_id": "9cc0…", "status": "completed", "duration_s": 74.2,
+ "confidence": 0.78, "cited_sources": 9, "verified_ratio": 0.89, "contradictions": 2,
+ "iterations": 2, "queries_run": 7, "pages_read": 6,
+ "llm_calls": 23, "failed_attempts": 3, "input_tokens": 61234, "output_tokens": 9876,
+ "failures_by_kind": {"rate_limit": 2, "context_too_large": 1},
+ "by_model": {"groq:llama-3.3-70b-versatile": {"calls": 14, "ok": 13, "failed": 1, …}, …}}
+```
+It loads straight into pandas (`pd.read_json("logs/runs/index.jsonl", lines=True)`) to compare
+quality against cost across runs and configurations. That's the raw material for the evaluation
+work in [#7](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/7).
+
+### 5.2 LangSmith tracing
+Set `LANGSMITH_API_KEY` in `.env`; tracing turns on automatically, with no code changes. Each run produces:
+- a root run **`deep-research`** whose id equals the local `run_id`, tagged `engine:<deep|react>` (plus
+  `clarification-reply` on resumed turns), with `thread_id` metadata so LangSmith **Threads** group a
+  whole conversation;
+- every graph node → the deep agent → sub-agents → tool calls, nested automatically;
+- one child run per **router attempt**, named like `groq:llama-3.3-70b-versatile` and carrying provider,
+  model, masked key, role and attempt metadata. A rate-limited attempt shows as an errored run right
+  next to the one that succeeded;
+- **feedback scores** on the root run after it completes (`confidence`, `verified_ratio`,
+  `cited_sources`, `iterations`, `failover_events`, `llm_calls`, `failed_attempts`, `total_tokens`,
+  `duration_s`), which can be filtered and charted across runs;
+- a **"🔎 View full trace in LangSmith"** button under each report.
+
+Everything LangSmith-related is best-effort and time-bounded: without a key there are no network
+calls, and a LangSmith outage never affects a research run.
+
+### 5.3 In the UI
+- **📊 Run metrics** (per report): LLM calls, failed attempts, input/output tokens, LLM time, a
+  per-model table, failures by kind, and the run log path.
+- **Sidebar → Observability:** LangSmith status and log locations.
+
+---
+
+## 6. Key engineering decisions & trade-offs
 
 | Decision | Why | Trade-off |
 |---|---|---|
@@ -338,7 +390,7 @@ flowchart LR
 
 ---
 
-## 6. Project structure
+## 7. Project structure
 
 ```
 .
@@ -356,6 +408,7 @@ flowchart LR
 │   ├── state.py               # ResearchState (TypedDict + reducers), checkpoint-friendly
 │   ├── nodes.py               # assess_clarity · ask_user · plan · research · evaluate · synthesize + routers
 │   ├── researcher.py          # deepagents / create_agent factory + context-size middleware
+│   ├── observability/         # logging_setup · telemetry (LLM calls) · run_log (run files) · tracing (LangSmith)
 │   ├── citations.py           # Draft → grounded ResearchReport (quote verification, deep links, linking)
 │   ├── graph.py               # StateGraph wiring + checkpointer
 │   ├── runner.py              # ResearchSession async API + CLI
@@ -372,14 +425,14 @@ flowchart LR
 │   ├── evidence.py            # SearchResult, ScrapedPage, Evidence, EvidenceEvaluation, SourceNotes
 │   ├── report.py              # SynthesisDraft, Source, ResearchReport (strict validators)
 │   └── events.py              # TraceEvent (thought/action/observation/dedup/skip/error/status)
-├── tests/                     # 91 tests: registry, deep links, scraper, schema, graph flow, key pools,
-│                              #   router, adapters, research-context middleware
+├── tests/                     # 104 tests: registry, deep links, scraper, schema, graph flow, key pools,
+│                              #   router, adapters, research-context middleware, observability, tracing
 ├── .env.example · requirements.txt · pyproject.toml · .streamlit/config.toml
 ```
 
 ---
 
-## 7. Data contracts (Pydantic v2)
+## 8. Data contracts (Pydantic v2)
 
 ```python
 class Source(BaseModel):
@@ -404,7 +457,7 @@ action, observation, dedup, skip, error}`.
 
 ---
 
-## 8. Getting started
+## 9. Getting started
 
 ### Prerequisites
 - Python **3.11+**
@@ -462,7 +515,7 @@ async for item in session.run("State of solid-state EV batteries in 2026"):
 
 ---
 
-## 9. Configuration reference
+## 10. Configuration reference
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -486,11 +539,13 @@ async for item in session.run("State of solid-state EV batteries in 2026"):
 | `MAX_SCRAPES_PER_ITERATION` | `4` | Scrape budget per iteration |
 | `SCRAPE_RELEVANCE_THRESHOLD` | `0.5` | Minimum Tavily score to allow a full scrape |
 | `SCRAPE_TIMEOUT_SECONDS` / `SCRAPE_MAX_CHARS` | `15` / `12000` | Fetch timeout and stored text cap |
+| `LOG_DIR` / `LOG_LEVEL` / `RUN_LOGS` | `logs` / `INFO` / `true` | App log, run files and run index location; run recording on/off |
+| `LANGSMITH_API_KEY` / `LANGSMITH_PROJECT` | — / `deep-research-agent` | Enables LangSmith tracing + feedback (`LANGSMITH_TRACING=false` turns it off) |
 | `MAX_REPORT_SOURCES` | `12` | Evidence items shown to the synthesizer |
 
 ---
 
-## 10. Testing
+## 11. Testing
 
 ```bash
 python -m pytest -q
@@ -510,12 +565,14 @@ The suite needs **no API keys and no network**:
 | `test_resilience_primitives.py` | Key parsing and masking, token buckets, round-robin, per-model cooldown scope, exponential backoff, Retry-After precedence, auth disable / quota parking, error classification for real `openai` SDK exceptions and Tavily errors, provider discovery and chain building |
 | `test_router.py` | Key rotation on 429, cross-provider failover, context-limit skips, per-model TPM routing, `max_tokens` forwarding and budgeting, provider error text in failover events, round-robin distribution, 413 skips the model and not the key, **proactive TPM/RPM routing**, dead-model memory, bounded waiting, exhaustion and fatal re-raise, sync path, `with_structured_output`, a real `create_agent` tool loop and a real **deepagents** run on the router, failover events reaching the LangGraph stream, Tavily key rotation |
 | `test_graph_flow.py` | **Full graph:** clarify → `interrupt` → resume → 2 iterations with query rewriting → synthesis with renumbering, hallucinated-id removal, verified deep links and contradictions. Also covers agent-failure fallback with the `max_iterations` cap, real `deepagents`/`create_agent` compilation, and **two-step synthesis** (key points reach the prompt, raw text doesn't, explicit `max_tokens`, extraction-failure fallback, irrelevant pages dropped). |
+| `test_observability.py` | JSON logging with run context and extras, idempotent setup, router records every attempt with masked keys, call summaries, run files + index for clarification and completed runs, recorder failures never raise |
+| `test_tracing.py` | Tracing off without a key / on with one (env export), root-run config, attempts as named child runs (real callback tree, failed attempt marked as error), node runs parented to the root run, feedback and run URL with a fake client |
 | `test_adapters.py` | Mistral id rewrite (9-char, deterministic, paired), Gemini placeholder signature (real ones kept), `max_tokens` rename, router uses the right adapter, sticky routing on/off and fallback when the sticky target is busy |
 | `test_research_context.py` | Old tool results cleared and the 2 most recent kept (both engines), deep engine exposes only allow-listed tools, trimmed observations with full text kept in the registry |
 
 ---
 
-## 11. Walkthrough of a single request
+## 12. Walkthrough of a single request
 
 *Illustrative example. Exact queries, counts and sources vary by model and by what the web returns.*
 
@@ -538,7 +595,7 @@ The suite needs **no API keys and no network**:
 
 ---
 
-## 12. Interview guide: talking points & likely questions
+## 13. Interview guide: talking points & likely questions
 
 **Elevator pitch:** *"A research agent that treats the LLM as an untrusted reasoning component. The
 LLM decides what to search and read and writes the prose. Deterministic code owns deduplication,
@@ -599,7 +656,7 @@ can't use it. It also has no notion of keys, cooldowns, budgets or shared state 
 
 ---
 
-## 13. Limitations & roadmap
+## 14. Limitations & roadmap
 
 **Known limitations**
 - Text fragments highlight in Chromium browsers and Safari 16.1+. Firefox opens the page without the highlight.
@@ -620,12 +677,12 @@ can't use it. It also has no notion of keys, cooldowns, budgets or shared state 
 - [ ] Source credibility scoring (domain allow and deny lists, publication date freshness)
 - [ ] Token-level streaming of the final report
 - [ ] Evaluation harness + golden dataset, then post-retrieval RAG ([#7](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/7))
-- [ ] LangSmith or Logfire tracing (traces are currently in-memory only)
+- [x] Persistent logs, run records and LangSmith tracing ([#15](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/15), [#16](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/16))
 - [ ] FastAPI + SSE backend so the agent can serve non-Streamlit clients
 
 ---
 
-## 14. Development history
+## 15. Development history
 
 Every change after the initial version went through a GitHub issue (problem, evidence, root cause,
 decision) and a PR (what changed, why, tests). The first live run showed calls growing to 8–12k
@@ -640,4 +697,6 @@ diagnosing it.
 | [#4](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/4) | Gemini 400 (missing thought signature) and Mistral 422 on mixed-provider history | Payload adapters + sticky routing ([#11](https://github.com/YashMittal1503/ReAct-Search-Agent/pull/11)) |
 | [#5](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/5) | Limits per provider, not per model; no context-window awareness | Per-model TPM + context limits ([#12](https://github.com/YashMittal1503/ReAct-Search-Agent/pull/12)) |
 | [#3](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/3) | ~7.5k-token synthesis prompt; flat 800-token estimate | Two-step synthesis + explicit `max_tokens` ([#13](https://github.com/YashMittal1503/ReAct-Search-Agent/pull/13)) |
+| [#15](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/15) | Logs went nowhere; trace events lost on refresh; no per-call LLM telemetry | Persistent logs + run records ([#17](https://github.com/YashMittal1503/ReAct-Search-Agent/pull/17)) |
+| [#16](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/16) | No hosted tracing or evaluation signal | LangSmith tracing + feedback (this PR) |
 | [#7](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/7) | Irrelevant text in retrieved pages | *Open:* evaluation harness first, then RAG |

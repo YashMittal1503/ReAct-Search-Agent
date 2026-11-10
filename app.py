@@ -26,6 +26,7 @@ from agent.graph import build_graph
 from agent.llm import build_router
 from agent.nodes import AgentDeps
 from agent.observability import RunRecorder, configure_logging
+from agent.observability.tracing import TracingConfig, configure_tracing
 from agent.resilience import KeyPool, ModelRouter, load_env, parse_keys
 from agent.runner import ResearchSession, RunResult
 from schemas.clarification import ClarificationRequest
@@ -92,6 +93,12 @@ def get_recorder() -> RunRecorder:
     settings = get_settings()
     configure_logging(settings.log_dir, settings.log_level)
     return RunRecorder(pathlib.Path(settings.log_dir) / "runs", enabled=settings.run_logs)
+
+
+@st.cache_resource
+def get_tracing() -> TracingConfig:
+    """Enable LangSmith tracing once per process if LANGSMITH_API_KEY is configured."""
+    return configure_tracing()
 
 
 @st.cache_resource
@@ -253,6 +260,8 @@ def render_report(result: RunResult, key: str, failovers: int = 0) -> None:
         st.markdown("\n".join(f"- {q}" for q in result.queries) or "_none_")
 
     render_run_metrics(result)
+    if result.trace_url:
+        st.link_button("🔎 View full trace in LangSmith", result.trace_url)
 
     st.download_button("⬇️ Download report (.md)", report_to_markdown(report), file_name="research_report.md",
                        mime="text/markdown", key=f"dl-{key}")
@@ -299,6 +308,13 @@ def sidebar(settings: Settings) -> tuple[str, int, float]:
         threshold = st.slider("Scrape relevance threshold", 0.0, 1.0, settings.scrape_relevance_threshold, 0.05)
 
         render_provider_health(get_router(), get_search_pool())
+        tracing = get_tracing()
+        st.subheader("Observability")
+        if tracing.enabled:
+            st.markdown(f"🟢 LangSmith tracing → project `{tracing.project}`")
+        else:
+            st.caption("LangSmith tracing off: add `LANGSMITH_API_KEY` to `.env` to enable.")
+        st.caption(f"Logs: `{get_settings().log_dir}/app.jsonl` · runs: `{get_settings().log_dir}/runs/`")
         st.caption(f"Thread `{st.session_state.thread_id[:8]}`")
     return engine, max_iter, threshold
 
@@ -386,6 +402,8 @@ def run_turn(prompt: str, graph: Any) -> None:
 
 def main() -> None:
     init_state()
+    get_recorder()  # configure persistent logging once per process
+    get_tracing()   # enable LangSmith before any LLM call (no-op without a key)
     settings = get_settings()
     engine, max_iter, threshold = sidebar(settings)
     graph = get_graph(engine, max_iter, threshold)
