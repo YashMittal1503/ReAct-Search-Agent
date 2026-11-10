@@ -42,6 +42,10 @@ class Settings(BaseSettings):
 
     # --- Agent behaviour ----------------------------------------------------------------------
     research_engine: Literal["deep", "react"] = "deep"
+    synthesis_mode: Literal["two_step", "single_step"] = Field(
+        default="two_step",
+        description="two_step = extract key points per page, then write (default); "
+                    "single_step = write from raw page excerpts (legacy, kept for evaluation).")
     max_iterations: int = Field(default=4, ge=1, le=8)
     max_clarification_rounds: int = Field(default=2, ge=0, le=5)
     min_query_words: int = Field(default=4, ge=1, description="Shorter prompts trigger clarification.")
