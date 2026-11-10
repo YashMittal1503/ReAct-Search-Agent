@@ -13,6 +13,7 @@ Features
 from __future__ import annotations
 
 import html
+import pathlib
 import uuid
 from typing import Any
 
@@ -24,6 +25,7 @@ from agent.config import Settings, get_settings
 from agent.graph import build_graph
 from agent.llm import build_router
 from agent.nodes import AgentDeps
+from agent.observability import RunRecorder, configure_logging
 from agent.resilience import KeyPool, ModelRouter, load_env, parse_keys
 from agent.runner import ResearchSession, RunResult
 from schemas.clarification import ClarificationRequest
@@ -82,6 +84,14 @@ def get_loop() -> BackgroundLoop:
 def get_checkpointer() -> InMemorySaver:
     """Shared checkpointer so paused threads survive graph rebuilds (e.g. settings changes)."""
     return InMemorySaver()
+
+
+@st.cache_resource
+def get_recorder() -> RunRecorder:
+    """Configure logging once per process and return the persistent run recorder."""
+    settings = get_settings()
+    configure_logging(settings.log_dir, settings.log_level)
+    return RunRecorder(pathlib.Path(settings.log_dir) / "runs", enabled=settings.run_logs)
 
 
 @st.cache_resource
@@ -197,6 +207,28 @@ def report_to_markdown(report: ResearchReport) -> str:
     return "\n".join(lines)
 
 
+def render_run_metrics(result: RunResult) -> None:
+    """LLM usage for this run: calls, tokens, latency and a per-model breakdown."""
+    llm = result.llm or {}
+    if not llm:
+        return
+    with st.expander(f"📊 Run metrics — {llm.get('llm_calls', 0)} LLM calls, "
+                     f"{llm.get('input_tokens', 0) + llm.get('output_tokens', 0):,} tokens, {result.duration_s:.0f}s"):
+        cols = st.columns(5)
+        cols[0].metric("LLM calls", llm.get("llm_calls", 0), help="Successful calls (attempts incl. failures below)")
+        cols[1].metric("Failed attempts", llm.get("failed_attempts", 0))
+        cols[2].metric("Input tokens", f"{llm.get('input_tokens', 0):,}")
+        cols[3].metric("Output tokens", f"{llm.get('output_tokens', 0):,}")
+        cols[4].metric("LLM time", f"{llm.get('llm_time_s', 0):.1f}s")
+        rows = [{"model": m, **v} for m, v in llm.get("by_model", {}).items()]
+        if rows:
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+        if llm.get("failures_by_kind"):
+            st.caption("Failures by kind: " + ", ".join(f"{k} × {v}" for k, v in llm["failures_by_kind"].items()))
+        if result.log_file:
+            st.caption(f"Run log: `{result.log_file}` · run id `{result.run_id}`")
+
+
 def render_report(result: RunResult, key: str, failovers: int = 0) -> None:
     report = result.report
     cols = st.columns(6)
@@ -219,6 +251,8 @@ def render_report(result: RunResult, key: str, failovers: int = 0) -> None:
 
     with st.expander(f"🔍 Search queries run ({len(result.queries)})"):
         st.markdown("\n".join(f"- {q}" for q in result.queries) or "_none_")
+
+    render_run_metrics(result)
 
     st.download_button("⬇️ Download report (.md)", report_to_markdown(report), file_name="research_report.md",
                        mime="text/markdown", key=f"dl-{key}")
@@ -258,7 +292,7 @@ def sidebar(settings: Settings) -> tuple[str, int, float]:
 
         st.subheader("Settings")
         engine = st.selectbox("Research engine", ["deep", "react"],
-                              index=0 if settings.research_engine == "deep" else 1,
+                              index=0 if settings.research_engine == "deep" else 1, key="engine",
                               help="deep = deepagents harness (planning + sub-agents); "
                                    "react = lightweight langchain create_agent loop.")
         max_iter = st.slider("Max iterations", 1, 6, settings.max_iterations)
@@ -313,7 +347,11 @@ def run_turn(prompt: str, graph: Any) -> None:
     with st.chat_message("user", avatar="🧑"):
         st.markdown(prompt)
 
-    session = ResearchSession(graph, thread_id=st.session_state.thread_id)
+    settings = get_settings()
+    chains = {role: [t.label for t in chain] for role, chain in get_router().chains.items()}
+    session = ResearchSession(graph, thread_id=st.session_state.thread_id, recorder=get_recorder(),
+                              metadata={"engine": st.session_state.get("engine", settings.research_engine),
+                                        "chains": chains})
     trace: list[TraceEvent] = []
     with st.chat_message("assistant", avatar="🔎"):
         status = st.status("Researching...", expanded=True)

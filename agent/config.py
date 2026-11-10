@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     research_recursion_limit: int = 60
     max_report_sources: int = 12
 
+    # --- Observability ------------------------------------------------------------------------
+    log_dir: str = Field(default="logs", description="app.jsonl (rotating) and runs/ live here.")
+    log_level: str = "INFO"
+    run_logs: bool = Field(default=True, description="Persist every run to logs/runs/<date>/<run_id>.jsonl.")
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

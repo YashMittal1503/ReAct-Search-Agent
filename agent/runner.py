@@ -13,7 +13,9 @@ It also works as a CLI: ``python -m agent.runner "your research question"``.
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
+import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -22,10 +24,14 @@ from typing import Any
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 
+from agent.observability import RunRecorder, collect_llm_calls, log_context, summarize_calls
 from agent.state import initial_state
 from schemas.clarification import ClarificationRequest
 from schemas.events import TraceEvent
 from schemas.report import ResearchReport
+
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class RunResult:
@@ -36,6 +42,28 @@ class RunResult:
     stats: dict[str, int] = field(default_factory=dict)
     queries: list[str] = field(default_factory=list)
     skipped_scrapes: list[dict[str, str]] = field(default_factory=list)
+    run_id: str = ""
+    llm: dict[str, Any] = field(default_factory=dict)  # summarize_calls(): calls, tokens, per-model breakdown
+    duration_s: float = 0.0
+    log_file: str = ""
+
+
+def report_summary(result: RunResult) -> dict[str, Any]:
+    """Quality/size indicators of a finished report (persisted to the run index for evaluation)."""
+    report = result.report
+    verified = sum(s.quote_verified for s in report.sources)
+    return {
+        "confidence": report.confidence_score,
+        "cited_sources": len(report.sources),
+        "verified_quotes": verified,
+        "verified_ratio": round(verified / len(report.sources), 3) if report.sources else 0.0,
+        "contradictions": len(report.contradictions_noted),
+        "iterations": result.iterations,
+        "queries_run": len(result.queries),
+        "unique_sources": result.stats.get("results", 0),
+        "pages_read": result.stats.get("pages_ok", 0),
+        "answer_chars": len(report.answer),
+    }
 
 
 RunItem = TraceEvent | ClarificationRequest | RunResult
@@ -44,9 +72,19 @@ RunItem = TraceEvent | ClarificationRequest | RunResult
 class ResearchSession:
     """One conversation thread with the research graph (supports multi-turn clarification)."""
 
-    def __init__(self, graph: CompiledStateGraph, thread_id: str | None = None) -> None:
+    def __init__(self, graph: CompiledStateGraph, thread_id: str | None = None, *,
+                 recorder: RunRecorder | None = None, metadata: dict[str, Any] | None = None) -> None:
+        """
+        Args:
+            graph: Compiled research graph (with a checkpointer).
+            thread_id: Conversation id; resuming a clarification reuses it.
+            recorder: Optional :class:`RunRecorder` that persists every run to ``logs/runs``.
+            metadata: Extra fields recorded with each run (engine, model chains, ...).
+        """
         self.graph = graph
         self.thread_id = thread_id or uuid.uuid4().hex
+        self.recorder = recorder
+        self.metadata = dict(metadata or {})
         self.config: dict[str, Any] = {"configurable": {"thread_id": self.thread_id}, "recursion_limit": 100}
 
     async def is_waiting_for_user(self) -> bool:
@@ -55,32 +93,76 @@ class ResearchSession:
         return bool(snapshot.next) and any(t.interrupts for t in snapshot.tasks)
 
     async def run(self, message: str) -> AsyncIterator[RunItem]:
-        """Start a new research request, or resume a paused one with the user's ``message``."""
-        if await self.is_waiting_for_user():
-            graph_input: Any = Command(resume={"answer": message})
-        else:
-            graph_input = initial_state(message)
+        """Start a new research request, or resume a paused one with the user's ``message``.
 
-        async for mode, chunk in self.graph.astream(graph_input, self.config, stream_mode=["custom", "updates"]):
-            if mode == "custom" and isinstance(chunk, dict) and "trace" in chunk:
-                yield TraceEvent.model_validate(chunk["trace"])
-            elif mode == "updates" and isinstance(chunk, dict) and "__interrupt__" in chunk:
-                for intr in chunk["__interrupt__"]:
-                    yield ClarificationRequest.model_validate(intr.value)
-                return
+        Each call is one *run* with its own ``run_id``. Every log record emitted during the run is tagged
+        with it, every LLM attempt is collected, and (if a recorder is set) the run is persisted to
+        ``logs/runs/<date>/<run_id>.jsonl`` plus a summary line in ``logs/runs/index.jsonl``.
+        """
+        run_id = str(uuid.uuid4())
+        resuming = await self.is_waiting_for_user()
+        graph_input: Any = Command(resume={"answer": message}) if resuming else initial_state(message)
+        handle = (self.recorder.start(run_id, thread_id=self.thread_id, query=message,
+                                      metadata={"resume": resuming, **self.metadata})
+                  if self.recorder else None)
+        started = time.monotonic()
+        status: str = "error"
+        summary: dict[str, Any] | None = None
+        extra: dict[str, Any] = {}
 
-        state = (await self.graph.aget_state(self.config)).values
-        if state.get("report"):
-            from tools.url_registry import URLRegistry
+        with log_context(run_id=run_id, thread_id=self.thread_id), collect_llm_calls() as calls:
+            logger.info("Run started (%s)", "resume" if resuming else "new request", extra={"query": message[:300]})
+            try:
+                async for mode, chunk in self.graph.astream(graph_input, self.config,
+                                                            stream_mode=["custom", "updates"]):
+                    if mode == "custom" and isinstance(chunk, dict) and "trace" in chunk:
+                        event = TraceEvent.model_validate(chunk["trace"])
+                        if handle:
+                            handle.trace(event.model_dump())
+                        yield event
+                    elif mode == "updates" and isinstance(chunk, dict) and "__interrupt__" in chunk:
+                        status = "awaiting_clarification"
+                        for intr in chunk["__interrupt__"]:
+                            request = ClarificationRequest.model_validate(intr.value)
+                            if handle:
+                                handle.write("clarification", **request.model_dump())
+                            yield request
+                        return
 
-            registry = URLRegistry.from_snapshot(state.get("registry"))
-            yield RunResult(
-                report=ResearchReport.model_validate(state["report"]),
-                iterations=state.get("iteration", 0),
-                stats=registry.stats(),
-                queries=list(registry.queries_run),
-                skipped_scrapes=list(state.get("skipped_scrapes", [])),
-            )
+                state = (await self.graph.aget_state(self.config)).values
+                status = "completed_without_report"
+                if state.get("report"):
+                    from tools.url_registry import URLRegistry
+
+                    registry = URLRegistry.from_snapshot(state.get("registry"))
+                    result = RunResult(
+                        report=ResearchReport.model_validate(state["report"]),
+                        iterations=state.get("iteration", 0),
+                        stats=registry.stats(),
+                        queries=list(registry.queries_run),
+                        skipped_scrapes=list(state.get("skipped_scrapes", [])),
+                        run_id=run_id,
+                        llm=summarize_calls(list(calls)),
+                        duration_s=round(time.monotonic() - started, 2),
+                        log_file=str(handle.path) if handle else "",
+                    )
+                    status, summary = "completed", report_summary(result)
+                    if handle:
+                        handle.write("report", **result.report.model_dump(mode="json"), queries=result.queries)
+                    yield result
+            except GeneratorExit:
+                status = "cancelled"
+                raise
+            except BaseException as exc:
+                extra = {"error": f"{type(exc).__name__}: {str(exc)[:500]}"}
+                logger.exception("Run failed")
+                raise
+            finally:
+                final = handle.finish(status, calls=list(calls), report=summary, extra=extra) if handle else {}
+                logger.info("Run finished: %s in %.1fs", status, time.monotonic() - started,
+                            extra={"status": status, **{k: final[k] for k in
+                                                        ("llm_calls", "input_tokens", "output_tokens",
+                                                         "failover_events") if k in final}})
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +171,15 @@ class ResearchSession:
 async def _cli(question: str) -> None:  # pragma: no cover - manual entry point
     from agent.graph import default_graph
 
-    session = ResearchSession(default_graph())
+    from pathlib import Path
+
+    from agent.config import get_settings
+    from agent.observability import configure_logging
+
+    settings = get_settings()
+    configure_logging(settings.log_dir, settings.log_level, console=False)
+    session = ResearchSession(default_graph(), recorder=RunRecorder(Path(settings.log_dir) / "runs",
+                                                                    enabled=settings.run_logs))
     message = question
     while True:
         paused = False
