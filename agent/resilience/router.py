@@ -42,6 +42,7 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import ConfigDict, Field
 
+from agent.observability.telemetry import LLMCallRecord, record_llm_call
 from agent.resilience.errors import ErrorKind, classify_error
 from agent.resilience.key_pool import KeyPool, KeySlot
 from agent.resilience.providers import (
@@ -367,6 +368,19 @@ class ModelRouter:
         return ChatResult(generations=[ChatGeneration(message=message)],
                           llm_output={"model_name": target.model, "provider": target.provider})
 
+    @staticmethod
+    def _record(role: str, target: ModelTarget, slot: KeySlot, attempt: int, started: float, tokens: int, *,
+                message: AIMessage | None = None, error: BaseException | None = None) -> None:
+        """Emit one :class:`LLMCallRecord` for this attempt (logs + current run's collector)."""
+        usage = (getattr(message, "usage_metadata", None) or {}) if message is not None else {}
+        record_llm_call(LLMCallRecord(
+            role=role, provider=target.provider, model=target.model, key=slot.masked,
+            outcome="ok" if error is None else classify_error(error).kind.value,
+            latency_ms=round((time.monotonic() - started) * 1000, 1), attempt=attempt, est_tokens=tokens,
+            input_tokens=int(usage.get("input_tokens", 0) or 0), output_tokens=int(usage.get("output_tokens", 0) or 0),
+            error="" if error is None else f"{type(error).__name__}: {str(error)[:300]}",
+        ))
+
     def _exhausted(self, role: str, last: BaseException | None) -> AllProvidersExhaustedError:
         detail = f"{type(last).__name__}: {str(last)[:300]}" if last else "all keys cooling down or disabled"
         self._emit("error", f"All providers exhausted for '{role}' chain ({detail})")
@@ -382,6 +396,7 @@ class ModelRouter:
         skip: set[ModelTarget] = set()
         first: ModelTarget | None = None
         last: Exception | None = None
+        attempt = 0
         affinity = _affinity.get()
         for target, slot, wait in self._attempts(role, tokens, skip, affinity.get(role) if affinity is not None else None):
             if wait > 0:
@@ -389,16 +404,19 @@ class ModelRouter:
                 await asyncio.sleep(wait)
                 slot.try_reserve(target.model, tokens)
             first = first or target
+            attempt += 1
             started = time.monotonic()
             try:
                 message = await self._client(target, slot).ainvoke(messages, stop=stop, **kwargs)
             except Exception as exc:  # noqa: BLE001 - classified below
                 last = exc
+                self._record(role, target, slot, attempt, started, tokens, error=exc)
                 if not self._on_failure(target, slot, exc, skip):
                     raise
                 continue
             if affinity is not None:
                 affinity[role] = target
+            self._record(role, target, slot, attempt, started, tokens, message=message)
             return self._finish(target, slot, message, started, first)
         raise self._exhausted(role, last) from last
 
@@ -411,6 +429,7 @@ class ModelRouter:
         skip: set[ModelTarget] = set()
         first: ModelTarget | None = None
         last: Exception | None = None
+        attempt = 0
         affinity = _affinity.get()
         for target, slot, wait in self._attempts(role, tokens, skip, affinity.get(role) if affinity is not None else None):
             if wait > 0:
@@ -418,16 +437,19 @@ class ModelRouter:
                 time.sleep(wait)
                 slot.try_reserve(target.model, tokens)
             first = first or target
+            attempt += 1
             started = time.monotonic()
             try:
                 message = self._client(target, slot).invoke(messages, stop=stop, **kwargs)
             except Exception as exc:  # noqa: BLE001 - classified below
                 last = exc
+                self._record(role, target, slot, attempt, started, tokens, error=exc)
                 if not self._on_failure(target, slot, exc, skip):
                     raise
                 continue
             if affinity is not None:
                 affinity[role] = target
+            self._record(role, target, slot, attempt, started, tokens, message=message)
             return self._finish(target, slot, message, started, first)
         raise self._exhausted(role, last) from last
 
