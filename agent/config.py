@@ -42,10 +42,21 @@ class Settings(BaseSettings):
 
     # --- Agent behaviour ----------------------------------------------------------------------
     research_engine: Literal["deep", "react"] = "deep"
-    synthesis_mode: Literal["two_step", "single_step"] = Field(
+    synthesis_mode: Literal["two_step", "single_step", "rag"] = Field(
         default="two_step",
         description="two_step = extract key points per page, then write (default); "
-                    "single_step = write from raw page excerpts (legacy, kept for evaluation).")
+                    "single_step = write from raw page excerpts (legacy, kept for evaluation); "
+                    "rag = write from retrieved passages (hybrid BM25 + embeddings; experiment #19).")
+    # --- Post-retrieval RAG (synthesis_mode="rag") -------------------------------------------
+    rag_chunk_chars: int = Field(default=900, ge=200, le=4_000)
+    rag_chunk_overlap: int = Field(default=150, ge=0, le=1_000)
+    rag_top_k: int = Field(default=4, ge=1, le=20, description="Chunks kept per query (facet).")
+    rag_neighbors: int = Field(default=1, ge=0, le=3, description="Adjacent chunks added for context.")
+    rag_budget_chars: int = Field(default=12_000, ge=2_000, le=60_000,
+                                  description="Max characters of passages sent to the synthesizer.")
+    rag_embeddings: Literal["auto", "off"] = Field(default="auto",
+                                                   description="auto = hybrid with local embeddings; off = BM25 only.")
+    rag_embedding_model: str = "BAAI/bge-small-en-v1.5"
     max_iterations: int = Field(default=4, ge=1, le=8)
     max_clarification_rounds: int = Field(default=2, ge=0, le=5)
     min_query_words: int = Field(default=4, ge=1, description="Shorter prompts trigger clarification.")

@@ -44,6 +44,8 @@ from schemas.evidence import Evidence, EvidenceEvaluation, SourceNotes
 from schemas.planning import ResearchPlan, SubQuery
 from schemas.report import BARE_CITATION_RE, ResearchReport, SynthesisDraft
 from tools.langchain_tools import ToolBudget, make_research_tools
+from tools.rag.embeddings import Embedder, get_default_embedder
+from tools.rag.retriever import select_passages
 from tools.scraper import PageScraper
 from tools.search import TavilySearcher, build_tavily_pool
 from tools.url_registry import URLRegistry
@@ -84,6 +86,8 @@ class AgentDeps:
     searcher_factory: Callable[[], TavilySearcher] | None = None
     scraper_factory: Callable[[], PageScraper] | None = None
     agent_factory: Callable[..., Any] = field(default=build_research_agent)
+    embedder_factory: Callable[[], Embedder | None] | None = None
+    """Embedding model for RAG synthesis (``None`` result -> BM25-only retrieval)."""
     today: Callable[[], str] = field(default=lambda: datetime.now().strftime("%B %d, %Y"))
 
     def __post_init__(self) -> None:
@@ -116,6 +120,9 @@ class AgentDeps:
             self.searcher_factory = lambda: TavilySearcher(
                 pool=pool, max_results=s.search_results_per_query, search_depth=s.tavily_search_depth
             )
+        if self.embedder_factory is None:
+            self.embedder_factory = (lambda: get_default_embedder(s.rag_embedding_model)) \
+                if s.rag_embeddings == "auto" else (lambda: None)
         if self.scraper_factory is None:
             self.scraper_factory = lambda: PageScraper(
                 timeout=s.scrape_timeout_seconds, max_chars=s.scrape_max_chars, concurrency=s.scrape_concurrency
@@ -484,6 +491,9 @@ class ResearchNodes:
         if self.s.synthesis_mode == "single_step":
             # Legacy path (kept for A/B evaluation): raw first-N-char excerpts of every source.
             digest = _evidence_digest(evidence, per_item=2_500, budget=30_000)
+        elif self.s.synthesis_mode == "rag":
+            # Experiment #19: retrieve the most relevant passages instead of whole pages / LLM notes.
+            digest = await self._rag_digest(question, evidence, registry.queries_run)
         else:
             # Step 1: distil each scraped page into key points with verbatim quotes (fast chain, parallel).
             notes = await self._extract_notes(question, evidence)
@@ -526,6 +536,45 @@ class ResearchNodes:
              f"Report ready: {len(report.sources)} cited sources ({verified} quotes verified), "
              f"confidence {report.confidence_score:.2f}")
         return {"report": report.model_dump()}
+
+    async def _rag_digest(self, question: str, evidence: list[Evidence], queries: list[str]) -> str:
+        """Numbered evidence where scraped pages are reduced to their most relevant passages.
+
+        Retrieval queries are the research question plus every search query the agent ran (one per
+        researched facet). Chunking, embedding and ranking are CPU-bound and run in a worker thread.
+        Snippet-only sources pass through unchanged; a source with no selected passage keeps its snippet.
+        """
+        pages = {ev.url: ev.content for ev in evidence if ev.content}
+        emit("status", "synthesize", f"Retrieving relevant passages from {len(pages)} pages…")
+        assert self.deps.embedder_factory is not None
+        s = self.s
+
+        def run():
+            embedder = self.deps.embedder_factory() if pages else None
+            try:
+                return select_passages(pages, [question, *queries], embedder=embedder,
+                                       chunk_chars=s.rag_chunk_chars, overlap=s.rag_chunk_overlap,
+                                       top_k=s.rag_top_k, neighbors=s.rag_neighbors,
+                                       budget_chars=s.rag_budget_chars)
+            except Exception:  # noqa: BLE001 - embedding failure mid-run: retry lexical-only
+                logger.warning("Hybrid retrieval failed; retrying with BM25 only", exc_info=True)
+                return select_passages(pages, [question, *queries], embedder=None,
+                                       chunk_chars=s.rag_chunk_chars, overlap=s.rag_chunk_overlap,
+                                       top_k=s.rag_top_k, neighbors=s.rag_neighbors,
+                                       budget_chars=s.rag_budget_chars)
+
+        selection = await asyncio.to_thread(run)
+        emit("observation", "synthesize",
+             f"RAG: kept {selection.selected_chunks} of {selection.total_chunks} chunks "
+             f"(≈{selection.selected_chars // 4:,} tokens) from {len(selection.passages)} pages · {selection.mode}",
+             total_chunks=selection.total_chunks, selected_chunks=selection.selected_chunks,
+             selected_chars=selection.selected_chars, mode=selection.mode)
+        blocks = []
+        for i, ev in enumerate(evidence, start=1):
+            passages = selection.render(ev.url) if ev.content else ""
+            body = f"Relevant passages:\n{passages}" if passages else f"Snippet: {ev.snippet}"
+            blocks.append(f"[{i}] {ev.title} — {ev.domain} (relevance {ev.score:.2f})\n{body}")
+        return "\n\n---\n\n".join(blocks)
 
     async def _extract_notes(self, question: str, evidence: list[Evidence]) -> list[tuple[Evidence, str]]:
         """Two-step synthesis, step 1: per-source key points with verbatim quotes.

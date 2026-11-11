@@ -14,6 +14,10 @@ VARIANTS: dict[str, dict[str, Any]] = {
     "baseline": {},                                   # production defaults (two-step synthesis)
     "single_step": {"synthesis_mode": "single_step"},  # legacy synthesis from raw excerpts (#3 A/B)
     "react_engine": {"research_engine": "react"},      # lighter ReAct engine (meaningful in e2e/snapshot)
+    # Experiment #19 (experiment/rag branch): post-retrieval RAG synthesis.
+    "rag": {"synthesis_mode": "rag"},                                   # hybrid BM25 + bge-small, RRF
+    "rag_bm25": {"synthesis_mode": "rag", "rag_embeddings": "off"},     # ablation: lexical only
+    "rag_tight": {"synthesis_mode": "rag", "rag_budget_chars": 8_000},  # ablation: smaller budget
 }
 
 
