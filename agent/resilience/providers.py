@@ -48,6 +48,8 @@ class ProviderSpec:
     headers: Mapping[str, str] = field(default_factory=dict)
     model_tpm: Mapping[str, float] = field(default_factory=dict)
     """Known per-model tokens-per-minute limits (providers such as Groq enforce TPM per model)."""
+    model_rpm: Mapping[str, float] = field(default_factory=dict)
+    """Known per-model requests-per-minute limits (e.g. Cerebras: gpt-oss-120b 5 vs qwen 450)."""
     context_limit: int | None = None
     """Max tokens (prompt + completion) the provider accepts per request, if lower than the model's."""
 
@@ -55,16 +57,21 @@ class ProviderSpec:
 PROVIDERS: dict[str, ProviderSpec] = {
     spec.name: spec
     for spec in (
+        # Model ids and free-tier limits verified 2026-11 against each provider's /models endpoint and
+        # the x-ratelimit-* response headers (see issue #22). Re-check when a provider retires models.
         ProviderSpec("groq", "Groq", "https://api.groq.com/openai/v1", "GROQ",
-                     main_models=("openai/gpt-oss-120b", "llama-3.3-70b-versatile"),
-                     fast_models=("llama-3.1-8b-instant", "qwen/qwen3-32b"),
+                     main_models=("openai/gpt-oss-120b", "qwen/qwen3.8-27b"),
+                     fast_models=("openai/gpt-oss-20b", "qwen/qwen3.8-27b"),
                      default_rpm=30,
-                     # Free-tier TPM per model (console.groq.com/settings/limits). Override with
-                     # GROQ_TPM (all models) or LLM_MODEL_TPM (per model) on paid plans.
-                     model_tpm={"openai/gpt-oss-120b": 8_000, "llama-3.3-70b-versatile": 12_000,
-                                "llama-3.1-8b-instant": 6_000, "qwen/qwen3-32b": 6_000}),
+                     # Free tier: 8k TPM and 1,000 requests/day per model. Override with GROQ_TPM (all
+                     # models) or LLM_MODEL_TPM (per model) on paid plans.
+                     model_tpm={"openai/gpt-oss-120b": 8_000, "openai/gpt-oss-20b": 8_000,
+                                "qwen/qwen3.8-27b": 8_000}),
         ProviderSpec("cerebras", "Cerebras", "https://api.cerebras.ai/v1", "CEREBRAS",
-                     main_models=("gpt-oss-120b",), fast_models=("llama3.1-8b",), default_rpm=30,
+                     main_models=("gpt-oss-120b",), fast_models=("qwen-3.8-27b",), default_rpm=30,
+                     # Free tier: gpt-oss-120b 5 RPM / 30k TPM; qwen-3.8-27b 450 RPM / 150k TPM.
+                     model_rpm={"gpt-oss-120b": 5, "qwen-3.8-27b": 450},
+                     model_tpm={"gpt-oss-120b": 30_000, "qwen-3.8-27b": 150_000},
                      context_limit=8_192),  # free-tier request cap; set CEREBRAS_CONTEXT=0 on paid plans
         ProviderSpec("mistral", "Mistral", "https://api.mistral.ai/v1", "MISTRAL",
                      main_models=("mistral-small-latest",), fast_models=("ministral-8b-latest",), default_rpm=60),
@@ -102,6 +109,7 @@ class ProviderConfig:
     rpm: float | None
     tpm: float | None
     model_tpm: dict[str, float | None] = field(default_factory=dict)
+    model_rpm: dict[str, float | None] = field(default_factory=dict)
     context: int | None = None
     model_context: dict[str, int | None] = field(default_factory=dict)
 
@@ -161,6 +169,7 @@ def load_provider_configs(
     """Discover every provider that has at least one key, in tier order."""
     configs: dict[str, ProviderConfig] = {}
     model_tpm_env = parse_model_limits(env.get("LLM_MODEL_TPM"))
+    model_rpm_env = parse_model_limits(env.get("LLM_MODEL_RPM"))
     model_ctx_env = parse_model_limits(env.get("LLM_MODEL_CONTEXT"))
     for name, spec in PROVIDERS.items():
         keys = parse_keys(env, spec.env_prefix)
@@ -169,12 +178,16 @@ def load_provider_configs(
             provider_tpm_set = (env.get(f"{spec.env_prefix}_TPM") or "").strip() != ""
             model_tpm: dict[str, float | None] = {} if provider_tpm_set else dict(spec.model_tpm)
             model_tpm.update({m: v for (p, m), v in model_tpm_env.items() if p == name})
+            provider_rpm_set = (env.get(f"{spec.env_prefix}_RPM") or "").strip() != ""
+            model_rpm: dict[str, float | None] = {} if provider_rpm_set else dict(spec.model_rpm)
+            model_rpm.update({m: v for (p, m), v in model_rpm_env.items() if p == name})
             ctx = _limit(env, f"{spec.env_prefix}_CONTEXT", spec.context_limit)
             configs[name] = ProviderConfig(
                 spec, keys,
                 rpm=_limit(env, f"{spec.env_prefix}_RPM", spec.default_rpm),
                 tpm=_limit(env, f"{spec.env_prefix}_TPM", spec.default_tpm),
                 model_tpm=model_tpm,
+                model_rpm=model_rpm,
                 context=int(ctx) if ctx else None,
                 model_context={m: (int(v) if v else None) for (p, m), v in model_ctx_env.items() if p == name},
             )
@@ -187,6 +200,7 @@ def load_provider_configs(
         configs["custom"] = ProviderConfig(
             spec, keys, rpm=_limit(env, "LLM_RPM", None), tpm=_limit(env, "LLM_TPM", None),
             model_tpm={m: v for (p, m), v in model_tpm_env.items() if p == "custom"},
+            model_rpm={m: v for (p, m), v in model_rpm_env.items() if p == "custom"},
             context=int(ctx) if ctx else None,
             model_context={m: (int(v) if v else None) for (p, m), v in model_ctx_env.items() if p == "custom"},
         )

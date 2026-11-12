@@ -341,12 +341,13 @@ async def test_context_limit_skips_target_without_calling_it() -> None:
     assert script.calls == [("cerebras", "c1", "gpt-oss-120b")]
 
 
-async def test_groq_large_request_uses_higher_tpm_model() -> None:
+async def test_large_request_uses_higher_tpm_model() -> None:
+    """Cerebras free tier: gpt-oss-120b 30k TPM vs qwen-3.8-27b 150k TPM (measured, issue #22)."""
     script = Script()
-    env = {"GROQ_API_KEY": "g1", "GROQ_RPM": "0"}
-    router = make_router(script, env=env, chain=["groq:openai/gpt-oss-120b", "groq:llama-3.3-70b-versatile"])
-    await router.agenerate("main", [HumanMessage("word " * 7_000)])  # ~9.5k: over 8k, under 12k
-    assert script.calls == [("groq", "g1", "llama-3.3-70b-versatile")]
+    env = {"CEREBRAS_API_KEY": "c1", "CEREBRAS_CONTEXT": "0"}
+    router = make_router(script, env=env, chain=["cerebras:gpt-oss-120b", "cerebras:qwen-3.8-27b"])
+    await router.agenerate("main", [HumanMessage("word " * 26_000)])  # ~33k tokens: over 30k, under 150k
+    assert script.calls == [("cerebras", "c1", "qwen-3.8-27b")]
 
 
 async def test_role_max_tokens_forwarded_and_used_for_budgeting() -> None:

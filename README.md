@@ -249,8 +249,8 @@ flowchart LR
         RCM["ResilientChatModel(role)<br/>LangChain BaseChatModel facade"]
     end
     RCM --> R["ModelRouter<br/>attempt planner + failure policy"]
-    R --> C1["main chain<br/>groq:gpt-oss-120b → groq:llama-3.3-70b → cerebras → mistral → gemini → openrouter → openai"]
-    R --> C2["fast chain<br/>groq:llama-3.1-8b → … → main models (last resort)"]
+    R --> C1["main chain<br/>groq:gpt-oss-120b → groq:qwen3.8-27b → cerebras:gpt-oss-120b → mistral → gemini → openrouter → openai"]
+    R --> C2["fast chain<br/>groq:gpt-oss-20b → groq:qwen3.8-27b → cerebras:qwen-3.8-27b → … → main models (last resort)"]
     R --> P1["KeyPool groq<br/>key1 key2 key3"]
     R --> P2["KeyPool gemini<br/>key1 …"]
     R --> P3["KeyPool openrouter …"]
@@ -303,9 +303,10 @@ flowchart LR
 - **Avoid instead of absorb:** proactive budgets mean most 429s are never triggered. Traffic moves to
   the next key or tier *before* the limit.
 - **Round-robin across keys** spreads parallel sub-agent calls, so N keys ≈ N× throughput.
-- **Per-model limits and cooldowns:** Groq and Gemini enforce limits per model, so budgets and
-  cooldowns are per model too. A 9.5k-token call that's too big for `gpt-oss-120b` (8k TPM) goes to
-  `llama-3.3-70b` (12k TPM) on the same Groq keys instead of leaving Groq entirely.
+- **Per-model limits and cooldowns:** providers enforce limits per model, so budgets and cooldowns
+  are per model too. On Cerebras' free tier, `gpt-oss-120b` allows 5 requests/30k tokens per minute
+  while `qwen-3.8-27b` allows 450/150k. Per-model RPM/TPM lets the router use each to its real limit,
+  and a request too big for one model goes to a higher-limit model on the same keys.
 - **Portable conversations:** payload adapters let Mistral and Gemini continue a conversation that
   started on another provider. Before adapters, they rejected it (verified live for Gemini).
 - **Fast chain for control steps:** clarify, plan and evaluate run on small, fast models and keep the big
@@ -337,7 +338,7 @@ Each completed run appends a line like this (abridged, illustrative values):
  "iterations": 2, "queries_run": 7, "pages_read": 6,
  "llm_calls": 23, "failed_attempts": 3, "input_tokens": 61234, "output_tokens": 9876,
  "failures_by_kind": {"rate_limit": 2, "context_too_large": 1},
- "by_model": {"groq:llama-3.3-70b-versatile": {"calls": 14, "ok": 13, "failed": 1, …}, …}}
+ "by_model": {"groq:openai/gpt-oss-120b": {"calls": 14, "ok": 13, "failed": 1, …}, …}}
 ```
 It loads straight into pandas (`pd.read_json("logs/runs/index.jsonl", lines=True)`) to compare
 quality against cost across runs and configurations. That's the raw material for the evaluation
@@ -349,7 +350,7 @@ Set `LANGSMITH_API_KEY` in `.env`; tracing turns on automatically, with no code 
   `clarification-reply` on resumed turns), with `thread_id` metadata so LangSmith **Threads** group a
   whole conversation;
 - every graph node → the deep agent → sub-agents → tool calls, nested automatically;
-- one child run per **router attempt**, named like `groq:llama-3.3-70b-versatile` and carrying provider,
+- one child run per **router attempt**, named like `groq:openai/gpt-oss-120b` and carrying provider,
   model, masked key, role and attempt metadata. A rate-limited attempt shows as an errored run right
   next to the one that succeeded;
 - **feedback scores** on the root run after it completes (`confidence`, `verified_ratio`,
@@ -505,9 +506,14 @@ async for item in session.run("State of solid-state EV batteries in 2026"):
 ### Model & rate-limit tips
 - **Add keys before anything else.** Each extra key adds throughput, and each extra provider adds a
   failover tier. A practical free setup: 2-3 Groq keys + 1 Cerebras + 1 Gemini + 1 OpenRouter.
-- **Leave `GROQ_TPM` unset** on the free tier. Built-in per-model limits (gpt-oss-120b 8k,
-  llama-3.3-70b 12k, llama-3.1-8b 6k, qwen3-32b 6k) are more precise, and setting `GROQ_TPM`
-  applies one value to every Groq model. On paid plans use `GROQ_TPM=0` or `LLM_MODEL_TPM`.
+- **`GROQ_TPM` can stay unset** on the free tier: every model Groq currently serves
+  (`gpt-oss-120b`, `gpt-oss-20b`, `qwen3.8-27b`) is limited to 8k TPM and 1,000 requests/day, and
+  those are the built-in values. `GROQ_TPM=8000` is equivalent today. On a paid plan use
+  `GROQ_TPM=0` (no proactive limit) or your plan's value.
+- Built-in model ids and free-tier limits were verified against each provider's `/models` endpoint
+  and `x-ratelimit-*` headers (issue [#22](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/22)).
+  Providers retire models; the router skips retired ones automatically, but refresh the defaults when
+  the trace shows `model_unavailable` failovers.
 - On a paid Cerebras plan set `CEREBRAS_CONTEXT=0` to lift the free tier's ~8k request cap.
 - Default model ids live in `agent/resilience/providers.py`. Override them per role with
   `LLM_CHAIN_MAIN` / `LLM_CHAIN_FAST`. Unknown or decommissioned models are skipped automatically.

@@ -160,6 +160,7 @@ class ModelRouter:
         self.providers = dict(providers)
         self.pools: dict[str, KeyPool] = {
             name: KeyPool(name, cfg.keys, rpm=cfg.rpm, tpm=cfg.tpm, model_tpm=cfg.model_tpm,
+                          model_rpm=cfg.model_rpm,
                           cooldown_base=cooldown_base, cooldown_max=cooldown_max)
             for name, cfg in self.providers.items()
         }
@@ -469,6 +470,7 @@ class ModelRouter:
             "providers": [
                 {"name": name, "label": self.providers[name].spec.label, "rpm": self.providers[name].rpm,
                  "tpm": self.providers[name].tpm, "model_tpm": dict(self.providers[name].model_tpm),
+                 "model_rpm": dict(self.providers[name].model_rpm),
                  "context": self.providers[name].context, "keys": pool.snapshot()}
                 for name, pool in self.pools.items()
             ],

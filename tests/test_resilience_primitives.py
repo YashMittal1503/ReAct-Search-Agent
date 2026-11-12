@@ -202,19 +202,33 @@ def test_error_detail_extraction(body: object, expected: str) -> None:
 # Per-model TPM and context limits (#5)
 # ---------------------------------------------------------------------------
 def test_per_model_tpm_precedence() -> None:
-    # Built-in Groq free-tier values apply per model when GROQ_TPM is not set.
+    # Built-in free-tier values apply per model when <P>_TPM is not set (measured, see issue #22).
+    cerebras = load_provider_configs({"CEREBRAS_API_KEY": "c"})["cerebras"]
+    assert cerebras.tpm_for("gpt-oss-120b") == 30_000 and cerebras.tpm_for("qwen-3.8-27b") == 150_000
+    assert cerebras.tpm_for("some-new-model") is None  # unknown model: provider default (none)
     groq = load_provider_configs({"GROQ_API_KEY": "g"})["groq"]
-    assert groq.tpm_for("llama-3.3-70b-versatile") == 12_000
-    assert groq.tpm_for("openai/gpt-oss-120b") == 8_000
-    assert groq.tpm_for("some-new-model") is None  # unknown model: provider default (none)
+    assert {groq.tpm_for(m) for m in ("openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b")} == {8_000}
 
-    # An explicit provider-wide GROQ_TPM overrides the built-ins for every model…
-    groq = load_provider_configs({"GROQ_API_KEY": "g", "GROQ_TPM": "8000"})["groq"]
-    assert groq.tpm_for("llama-3.3-70b-versatile") == 8_000
+    # An explicit provider-wide CEREBRAS_TPM overrides the built-ins for every model…
+    cerebras = load_provider_configs({"CEREBRAS_API_KEY": "c", "CEREBRAS_TPM": "20000"})["cerebras"]
+    assert cerebras.tpm_for("qwen-3.8-27b") == 20_000
     # …and a per-model override beats everything.
-    env = {"GROQ_API_KEY": "g", "GROQ_TPM": "8000", "LLM_MODEL_TPM": "groq:llama-3.3-70b-versatile=30000"}
-    groq = load_provider_configs(env)["groq"]
-    assert groq.tpm_for("llama-3.3-70b-versatile") == 30_000 and groq.tpm_for("openai/gpt-oss-120b") == 8_000
+    env = {"CEREBRAS_API_KEY": "c", "CEREBRAS_TPM": "20000", "LLM_MODEL_TPM": "cerebras:qwen-3.8-27b=99000"}
+    cerebras = load_provider_configs(env)["cerebras"]
+    assert cerebras.tpm_for("qwen-3.8-27b") == 99_000 and cerebras.tpm_for("gpt-oss-120b") == 20_000
+
+
+def test_per_model_rpm_limits() -> None:
+    cerebras = load_provider_configs({"CEREBRAS_API_KEY": "c"})["cerebras"]
+    assert cerebras.model_rpm == {"gpt-oss-120b": 5, "qwen-3.8-27b": 450}
+    pool = KeyPool("cerebras", ["k"], rpm=30, model_rpm=cerebras.model_rpm)
+    slot = pool.slots[0]
+    assert slot._limits("gpt-oss-120b").rpm.rate == 5 / 60 and slot._limits("qwen-3.8-27b").rpm.rate == 450 / 60
+    assert slot._limits("other").rpm.rate == 30 / 60  # falls back to the provider RPM
+    # Provider-wide CEREBRAS_RPM disables the built-ins; LLM_MODEL_RPM overrides per model.
+    env = {"CEREBRAS_API_KEY": "c", "CEREBRAS_RPM": "10", "LLM_MODEL_RPM": "cerebras:gpt-oss-120b=2"}
+    cfg = load_provider_configs(env)["cerebras"]
+    assert cfg.rpm == 10 and cfg.model_rpm == {"gpt-oss-120b": 2.0}
 
 
 def test_context_limits_and_keyslot_uses_model_tpm() -> None:
