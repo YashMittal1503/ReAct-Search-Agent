@@ -23,7 +23,7 @@ from langgraph.config import get_stream_writer
 from langgraph.types import interrupt
 from pydantic import BaseModel
 
-from agent.citations import build_report
+from agent.citations import build_report, count_valid_citations
 from agent.config import Settings
 from agent.llm import build_chat_model, build_router, structured_call
 from agent.prompts import CLARIFIER_SYSTEM, EVALUATOR_SYSTEM, EXTRACTOR_SYSTEM, PLANNER_SYSTEM, SYNTHESIZER_SYSTEM
@@ -63,6 +63,7 @@ EXTRACT_MAX_TOKENS = 1_024
 EXTRACT_CONCURRENCY = 4
 FALLBACK_EXCERPT_CHARS = 1_500  # used when extraction fails
 SYNTH_MAX_TOKENS = 4_096        # the report itself needs a larger completion cap
+MIN_CITED_SOURCES = 3           # fewer distinct cited sources triggers one revision (#24)
 
 
 # ---------------------------------------------------------------------------
@@ -498,16 +499,13 @@ class ResearchNodes:
         # Step 2: write the report from the distilled notes.
         conflicts = evaluation.get("conflicting_claims", [])
         try:
-            draft = await self._structured(
-                SynthesisDraft,
-                [SystemMessage(SYNTHESIZER_SYSTEM.format(today=self.deps.today())),
-                 HumanMessage(f"Question:\n\"\"\"{question}\"\"\"\n\n"
-                              + (f"Known conflicting claims:\n" + "\n".join(f"- {c}" for c in conflicts) + "\n\n"
-                                 if conflicts else "")
-                              + f"Numbered evidence:\n\n{digest}")],
-                fast=False,
-                max_tokens=SYNTH_MAX_TOKENS,
-            )
+            messages = [SystemMessage(SYNTHESIZER_SYSTEM.format(today=self.deps.today())),
+                        HumanMessage(f"Question:\n\"\"\"{question}\"\"\"\n\n"
+                                     + (f"Known conflicting claims:\n" + "\n".join(f"- {c}" for c in conflicts)
+                                        + "\n\n" if conflicts else "")
+                                     + f"Numbered evidence:\n\n{digest}")]
+            draft = await self._structured(SynthesisDraft, messages, fast=False, max_tokens=SYNTH_MAX_TOKENS)
+            draft = await self._ensure_citations(draft, messages, len(evidence))
             report = build_report(draft, evidence, evaluator_confidence=evaluation.get("confidence"),
                                   extra_contradictions=conflicts)
         except Exception as exc:  # noqa: BLE001 - last-resort degradation keeps the UI useful
@@ -526,6 +524,44 @@ class ResearchNodes:
              f"Report ready: {len(report.sources)} cited sources ({verified} quotes verified), "
              f"confidence {report.confidence_score:.2f}")
         return {"report": report.model_dump()}
+
+    async def _ensure_citations(self, draft: SynthesisDraft, messages: list[BaseMessage],
+                                n_evidence: int) -> SynthesisDraft:
+        """Guard against reports that ignore the citation instructions (issue #24).
+
+        Structured output only validates the *shape* of the draft. Models occasionally return a correct
+        report with no ``[n]`` markers at all. If a report drawn from ``n_evidence`` sources cites fewer
+        than ``min(MIN_CITED_SOURCES, n_evidence)`` distinct sources, ask once for a cited revision, with
+        the draft and explicit feedback, and keep whichever version cites more (never worse).
+        """
+        required = min(MIN_CITED_SOURCES, n_evidence)
+        cited = count_valid_citations(draft.answer, n_evidence)
+        if cited >= required:
+            return draft
+        emit("thought", "synthesize",
+             f"Draft cites {cited} source(s); at least {required} required — requesting a cited revision")
+        feedback = HumanMessage(
+            f"Your report cited only {cited} of the {n_evidence} numbered evidence sources. Every factual "
+            "claim must be followed by its evidence number(s) in square brackets, e.g. [2] or [1][3], using "
+            "only numbers from the evidence list, and `citations` must list a verbatim quote for each number "
+            "used. Return the complete report again with inline citations added. Do not change its "
+            f"substance.\n\nYour previous report:\n\n{draft.answer}")
+        # Size the completion cap from the draft being rewritten (≈1.5× its length + headroom for the
+        # citations list) instead of the full 4k: the request then still fits free-tier TPM limits
+        # (e.g. Groq 8k) and low-credit providers that reject large max_tokens (seen live: #24).
+        revision_cap = int(min(SYNTH_MAX_TOKENS, max(1_200, len(draft.answer) / 4 * 1.5 + 600)))
+        try:
+            revised = await self._structured(SynthesisDraft, [*messages, feedback], fast=False,
+                                             max_tokens=revision_cap)
+        except RECOVERABLE_LLM_ERRORS as exc:
+            emit("error", "synthesize", f"Citation revision failed ({type(exc).__name__}); keeping the original draft")
+            return draft
+        revised_cited = count_valid_citations(revised.answer, n_evidence)
+        if revised_cited > cited:
+            emit("observation", "synthesize", f"Revision cites {revised_cited} source(s) (was {cited})")
+            return revised
+        emit("error", "synthesize", f"Revision still cites {revised_cited} source(s); keeping the original draft")
+        return draft
 
     async def _extract_notes(self, question: str, evidence: list[Evidence]) -> list[tuple[Evidence, str]]:
         """Two-step synthesis, step 1: per-source key points with verbatim quotes.

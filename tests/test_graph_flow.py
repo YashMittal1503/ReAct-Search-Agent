@@ -44,7 +44,7 @@ class FakeLLM:
 
     async def __call__(self, schema: type, messages: list[BaseMessage], fast: bool, max_tokens: int | None = None) -> Any:
         n = self.calls[schema.__name__] = self.calls.get(schema.__name__, 0) + 1
-        self.max_tokens[schema.__name__] = max_tokens
+        self.max_tokens.setdefault(schema.__name__, max_tokens)  # first call per schema (revisions excluded)
         prompt = str(messages[-1].content)
         if schema is ClarityAssessment:
             request = prompt.split('"""')[1]
@@ -64,7 +64,7 @@ class FakeLLM:
                 return SourceNotes(relevant=False)
             return SourceNotes(relevant=True, key_points=[KeyPoint(claim="Monoliths suit small teams", quote=QUOTE)])
         if schema is SynthesisDraft:
-            self.synthesis_prompt = prompt
+            self.synthesis_prompt = self.synthesis_prompt or str(messages[1].content)  # original evidence prompt
             return SynthesisDraft(
                 answer="**TL;DR** Monoliths win for small teams [2]. Microservices scale orgs [1, 2]. Bogus [99].\n\n## Sources\n- junk",
                 confidence_score=0.8,

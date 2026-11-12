@@ -35,6 +35,17 @@ def _normalize_markers(answer: str) -> str:
     return _GROUP_RE.sub(lambda m: "".join(f"[{n.strip()}]" for n in re.split(r"[,;]", m.group(1))), answer)
 
 
+def count_valid_citations(answer: str, n_evidence: int) -> int:
+    """Distinct evidence ids (1..n_evidence) cited in ``answer``, after the same normalization as
+    :func:`build_report` (grouped ``[1, 2]``, linked forms, trailing sources section stripped).
+
+    >>> count_valid_citations("A [1]. B [1, 3]. C [[2]](http://x). Bogus [9].", 3)
+    3
+    """
+    ids = {int(m.group(1)) for m in BARE_CITATION_RE.finditer(_normalize_markers(answer))}
+    return sum(1 for i in ids if 1 <= i <= n_evidence)
+
+
 def _claim_context(answer: str, source_id: int) -> str:
     """The sentence in ``answer`` that cites ``source_id`` (used when the LLM omitted a quote)."""
     marker = f"[{source_id}]"
