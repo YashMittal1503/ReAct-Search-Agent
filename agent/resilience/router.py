@@ -341,6 +341,11 @@ class ModelRouter:
         elif err.kind is ErrorKind.TOOL_CALL_FAILED:
             skip.add(target)
             msg = f"{target.label} produced an invalid tool call → retrying on another model"
+        elif err.kind is ErrorKind.TRANSIENT and "timeout" in type(exc).__name__.lower():
+            # A hung request is usually a one-off (measured: Gemini flash-lite answers the same
+            # request in ~4s on retry), so only this key cools down; the model's other keys stay
+            # in play for this request. Each (model, key) pair is still tried at most once.
+            msg = f"{where} timed out → trying the next key"
         elif err.kind is ErrorKind.TRANSIENT:
             skip.add(target)
             msg = f"{target.label} transient error ({err.status or type(exc).__name__}) → failing over"

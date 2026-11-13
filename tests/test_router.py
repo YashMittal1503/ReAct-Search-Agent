@@ -97,6 +97,26 @@ async def test_rate_limited_key_rotates_to_next_key_same_tier() -> None:
     assert script.calls == [("groq", "g2", "llama")]
 
 
+async def test_timeout_tries_the_same_model_on_the_next_key() -> None:
+    """A hung request is a one-off: retry the model on another key before leaving it (eval replay)."""
+    script = Script()
+    router = make_router(script)
+    request = httpx.Request("POST", "https://api.test/v1/chat")
+    script.outcomes[("groq", "g1", "llama")] = [openai.APITimeoutError(request=request)]
+    result = await router.agenerate("main", MSGS)
+    assert script.calls == [("groq", "g1", "llama"), ("groq", "g2", "llama")]
+    assert result.generations[0].message.content == "answer from groq:llama"
+
+
+async def test_server_error_still_fails_over_to_the_next_model() -> None:
+    script = Script()
+    router = make_router(script)
+    script.outcomes[("groq", "g1", "llama")] = [api_error(500, "internal error")]
+    result = await router.agenerate("main", MSGS)
+    assert [c[0] for c in script.calls] == ["groq", "gemini"]  # 5xx is model-wide: skip llama's other key
+    assert result.generations[0].message.content == "answer from gemini:flash"
+
+
 async def test_all_keys_limited_fails_over_across_providers() -> None:
     script = Script()
     router = make_router(script)
