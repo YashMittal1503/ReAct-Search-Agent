@@ -9,6 +9,7 @@ deepagents>=0.2                # Deep-agent harness (planning, sub-agents, ReAct
 tavily-python>=0.5
 httpx>=0.27
 trafilatura>=2.0
+fastembed>=0.4            # local embeddings for RAG synthesis (experiment #19)
 
 # --- Validation / config -----------------------------------------------------
 pydantic>=2.7

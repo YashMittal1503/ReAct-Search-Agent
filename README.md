@@ -367,6 +367,24 @@ calls, and a LangSmith outage never affects a research run.
 
 ---
 
+### 5.4 Experiment: post-retrieval RAG (`experiment/rag` branch, [#19](https://github.com/YashMittal1503/ReAct-Search-Agent/issues/19))
+`SYNTHESIS_MODE=rag` replaces per-page LLM key-point extraction with **retrieval**:
+1. Chunk scraped pages (`tools/rag/chunker.py`): paragraph-packed, heading-aware chunks (~900 chars)
+   with sentence overlap.
+2. Rank chunks for **each researched facet** (the question plus every search query the agent ran)
+   using **BM25 + local `bge-small-en-v1.5` embeddings** (fastembed/ONNX, CPU, no API), fused with
+   Reciprocal Rank Fusion. If the embedding model is unavailable, it falls back to BM25.
+3. Select under a 12k-character budget: the best chunk of **every** source first (so no source or
+   minority view is dropped), then the top-k chunks per facet, then neighbouring chunks for context.
+4. The synthesizer gets the passages in document order, with "[…]" marking gaps. Citations are
+   still verified against the full page text.
+
+Compared with `two_step`, this removes one LLM call per scraped page. Whether quality holds is
+decided by the harness (`replay --variant rag` vs `baseline`, then `evals.compare`). Ablations:
+`rag_bm25`, `rag_tight`. Merged to `main` only on a **SHIP** verdict.
+
+---
+
 ## 6. Key engineering decisions & trade-offs
 
 | Decision | Why | Trade-off |
@@ -543,7 +561,8 @@ async for item in session.run("State of solid-state EV batteries in 2026"):
 | `SCRAPE_TIMEOUT_SECONDS` / `SCRAPE_MAX_CHARS` | `15` / `12000` | Fetch timeout and stored text cap |
 | `LOG_DIR` / `LOG_LEVEL` / `RUN_LOGS` | `logs` / `INFO` / `true` | App log, run files and run index location; run recording on/off |
 | `LANGSMITH_API_KEY` / `LANGSMITH_PROJECT` | — / `deep-research-agent` | Enables LangSmith tracing + feedback (`LANGSMITH_TRACING=false` turns it off) |
-| `SYNTHESIS_MODE` | `two_step` | `two_step` (key points, then report) or `single_step` (legacy raw excerpts; for evaluation) |
+| `SYNTHESIS_MODE` | `two_step` | `two_step` (key points, then report), `single_step` (legacy raw excerpts; for evaluation) or `rag` (retrieved passages; **experiment/rag branch**) |
+| `RAG_*` | see `.env.example` | Chunk size/overlap, top-k per facet, neighbours, passage budget, embeddings on/off, embedding model |
 | `MAX_REPORT_SOURCES` | `12` | Evidence items shown to the synthesizer |
 
 ---

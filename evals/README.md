@@ -31,7 +31,7 @@ without the question prefix, and answerable questions without nuggets).
 
 Filters: `--ids q01 q07`, `--domains health energy`, `--limit 5`. Variants live in
 [`variants.py`](variants.py): `baseline` (production defaults), `single_step` (legacy synthesis from
-raw excerpts), `react_engine`. Add one entry per experiment.
+raw excerpts), `react_engine`, and on the `experiment/rag` branch `rag` (hybrid BM25 + bge-small passages), `rag_bm25` (lexical-only ablation) and `rag_tight` (8k-char passage budget). Add one entry per experiment.
 
 Outputs: `results/<UTC>-<mode>-<variant>/` with `results.jsonl` (per question: scores, judge
 verdicts with justifications, LLM usage, the answer), `summary.json` and `summary.md`. Snapshots and
