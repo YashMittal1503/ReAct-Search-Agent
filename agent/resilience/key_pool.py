@@ -282,7 +282,7 @@ class KeyPool:
             return seconds
         if err.kind is ErrorKind.QUOTA_EXHAUSTED:
             slot.rate_limited += 1
-            slot.cooldown(ALL_SCOPES, err.retry_after or self.quota_cooldown)
+            slot.cooldown(scope if err.model_scoped else ALL_SCOPES, err.retry_after or self.quota_cooldown)
             return err.retry_after or self.quota_cooldown
         if err.kind is ErrorKind.AUTH:
             slot.disabled_reason = err.message[:160] or "authentication failed"

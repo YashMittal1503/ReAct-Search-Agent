@@ -52,6 +52,9 @@ class ClassifiedError:
     retry_after: float | None = None
     detail: str = ""
     """The provider's own human-readable error message (from the response body), if any."""
+    model_scoped: bool = False
+    """A quota that belongs to one model (e.g. Gemini's per-model requests/day, Groq's per-model
+    tokens/day): park only that model on the key, not the whole key."""
 
     @property
     def recoverable(self) -> bool:
@@ -167,12 +170,15 @@ def classify_error(exc: BaseException) -> ClassifiedError:
     """Map an exception from any provider SDK to an :class:`ErrorKind`."""
     status = _status(exc)
     name = type(exc).__name__
-    msg = f"{name}: {exc}".lower()
+    detail = error_detail(exc)
+    # Some SDK exceptions stringify to just "Error code: 429" (e.g. Gemini's list-wrapped body), so
+    # classify on the provider's own message too: it is what says "per day" vs "per minute".
+    msg = f"{name}: {exc} {detail}".lower()
     message = str(exc) or name
 
-    def make(kind: ErrorKind, retry: bool = False) -> ClassifiedError:
+    def make(kind: ErrorKind, retry: bool = False, model_scoped: bool = False) -> ClassifiedError:
         return ClassifiedError(kind, message, status, extract_retry_after(exc) if retry else None,
-                               detail=error_detail(exc))
+                               detail=detail, model_scoped=model_scoped)
 
     # --- Tavily SDK exceptions (no status code attached) ----------------------------------
     if name in {"UsageLimitExceededError", "TavilyKeylessLimitError"}:
@@ -187,8 +193,9 @@ def classify_error(exc: BaseException) -> ClassifiedError:
                               "too many tokens", "reduce the length", "prompt is too long", "input is too long"):
         return make(ErrorKind.CONTEXT_TOO_LARGE)
     if status == 402 or _any(msg, "insufficient_quota", "insufficient credits", "credit balance", "billing",
-                              "exceeded your current quota", "payment required"):
-        return make(ErrorKind.QUOTA_EXHAUSTED, retry=True)
+                              "exceeded your current quota", "payment required", "requests per day",
+                              "per day limit", "tokens per day", "free_tier_requests"):
+        return make(ErrorKind.QUOTA_EXHAUSTED, retry=True, model_scoped=_any(msg, "for model", "model:"))
     if status == 429 or _any(msg, "rate limit", "rate_limit", "too many requests", "tokens per minute",
                               "requests per minute", "resource_exhausted", "resource exhausted"):
         return make(ErrorKind.RATE_LIMIT, retry=True)

@@ -98,6 +98,22 @@ def test_auth_disables_and_quota_parks_whole_key(clock: Clock) -> None:
     assert pool.available  # b is parked, not disabled
 
 
+def test_per_model_daily_quota_parks_only_that_model(clock: Clock) -> None:
+    """Gemini's free tier: flash-latest has a 20 requests/day quota while flash-lite on the same key
+    still works. Its SDK exception stringifies to just "Error code: 429"; the cause is in the body."""
+    response = httpx.Response(429, request=httpx.Request("POST", "https://api.test/v1/chat"))
+    body = [{"error": {"code": 429, "message": "You exceeded your current quota ... Quota exceeded for metric: "
+             "generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 20, model: "
+             "gemini-3.8-flash, description: Generate content requests per day limit exceeded on Free Tier."}}]
+    err = classify_error(openai.RateLimitError("Error code: 429", response=response, body=body))
+    assert err.kind is ErrorKind.QUOTA_EXHAUSTED and err.model_scoped
+    pool = KeyPool("gemini", ["k"], quota_cooldown=3600)
+    slot = pool.slots[0]
+    pool.apply_failure(slot, "gemini-flash-latest", err)
+    assert slot.cooldown_remaining("gemini-flash-latest") == 3600
+    assert slot.cooldown_remaining("gemini-flash-lite-latest") == 0  # the other model stays usable
+
+
 def test_pick_prefers_ready_key_then_soonest(clock: Clock) -> None:
     pool = KeyPool("tavily", ["a", "b"], rpm=6)  # burst capacity 1 per key
     first, w1 = pool.pick("s")

@@ -79,7 +79,11 @@ PROVIDERS: dict[str, ProviderSpec] = {
         ProviderSpec("mistral", "Mistral", "https://api.mistral.ai/v1", "MISTRAL",
                      main_models=("mistral-small-latest",), fast_models=("ministral-8b-latest",), default_rpm=60),
         ProviderSpec("gemini", "Google Gemini", "https://generativelanguage.googleapis.com/v1beta/openai/", "GEMINI",
-                     main_models=("gemini-flash-latest",), fast_models=("gemini-flash-lite-latest",), default_rpm=10),
+                     main_models=("gemini-flash-latest", "gemini-flash-lite-latest"),
+                     # flash-latest allows only 20 requests/day on the free tier; flash-lite (much higher
+                     # daily quota, 1M context) is the main-role fallback for requests too large for the
+                     # 8k Groq/Cerebras free tiers.
+                     fast_models=("gemini-flash-lite-latest",), default_rpm=10),
         ProviderSpec("openrouter", "OpenRouter", "https://openrouter.ai/api/v1", "OPENROUTER",
                      main_models=("meta-llama/llama-3.3-70b-instruct",),
                      fast_models=("meta-llama/llama-3.1-8b-instruct",), default_rpm=20,
