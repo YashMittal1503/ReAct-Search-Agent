@@ -134,6 +134,8 @@ class KeySlot:
     rpm: float | None = None
     tpm: float | None = None
     model_tpm: dict[str, float | None] = field(default_factory=dict)
+    model_rpm: dict[str, float | None] = field(default_factory=dict)
+    """Per-scope (model) RPM overrides; falls back to ``rpm``."""
     """Per-scope (model) TPM overrides; falls back to ``tpm``."""
     masked: str = ""
     disabled_reason: str | None = None
@@ -154,9 +156,10 @@ class KeySlot:
     def _limits(self, scope: str) -> ScopeLimits:
         if scope not in self.limits:
             # RPM bucket allows a small burst (~10s worth); TPM bucket allows a full minute.
-            burst = max(1.0, math.ceil((self.rpm or 0) / 6)) if self.rpm else None
+            rpm = self.model_rpm[scope] if scope in self.model_rpm else self.rpm
+            burst = max(1.0, math.ceil(rpm / 6)) if rpm else None
             tpm = self.model_tpm[scope] if scope in self.model_tpm else self.tpm
-            self.limits[scope] = ScopeLimits(rpm=TokenBucket(self.rpm, burst), tpm=TokenBucket(tpm))
+            self.limits[scope] = ScopeLimits(rpm=TokenBucket(rpm, burst), tpm=TokenBucket(tpm))
         return self.limits[scope]
 
     def cooldown_remaining(self, scope: str) -> float:
@@ -213,13 +216,15 @@ class KeyPool:
         rpm: float | None = None,
         tpm: float | None = None,
         model_tpm: dict[str, float | None] | None = None,
+        model_rpm: dict[str, float | None] | None = None,
         cooldown_base: float = 20.0,
         cooldown_max: float = 300.0,
         quota_cooldown: float = 3600.0,
         transient_cooldown: float = 5.0,
     ) -> None:
         self.provider = provider
-        self.slots = [KeySlot(key=k, rpm=rpm, tpm=tpm, model_tpm=dict(model_tpm or {})) for k in keys if k]
+        self.slots = [KeySlot(key=k, rpm=rpm, tpm=tpm, model_tpm=dict(model_tpm or {}),
+                              model_rpm=dict(model_rpm or {})) for k in keys if k]
         self.cooldown_base = cooldown_base
         self.cooldown_max = cooldown_max
         self.quota_cooldown = quota_cooldown
@@ -277,7 +282,7 @@ class KeyPool:
             return seconds
         if err.kind is ErrorKind.QUOTA_EXHAUSTED:
             slot.rate_limited += 1
-            slot.cooldown(ALL_SCOPES, err.retry_after or self.quota_cooldown)
+            slot.cooldown(scope if err.model_scoped else ALL_SCOPES, err.retry_after or self.quota_cooldown)
             return err.retry_after or self.quota_cooldown
         if err.kind is ErrorKind.AUTH:
             slot.disabled_reason = err.message[:160] or "authentication failed"

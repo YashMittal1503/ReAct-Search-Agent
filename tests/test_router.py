@@ -97,6 +97,26 @@ async def test_rate_limited_key_rotates_to_next_key_same_tier() -> None:
     assert script.calls == [("groq", "g2", "llama")]
 
 
+async def test_timeout_tries_the_same_model_on_the_next_key() -> None:
+    """A hung request is a one-off: retry the model on another key before leaving it (eval replay)."""
+    script = Script()
+    router = make_router(script)
+    request = httpx.Request("POST", "https://api.test/v1/chat")
+    script.outcomes[("groq", "g1", "llama")] = [openai.APITimeoutError(request=request)]
+    result = await router.agenerate("main", MSGS)
+    assert script.calls == [("groq", "g1", "llama"), ("groq", "g2", "llama")]
+    assert result.generations[0].message.content == "answer from groq:llama"
+
+
+async def test_server_error_still_fails_over_to_the_next_model() -> None:
+    script = Script()
+    router = make_router(script)
+    script.outcomes[("groq", "g1", "llama")] = [api_error(500, "internal error")]
+    result = await router.agenerate("main", MSGS)
+    assert [c[0] for c in script.calls] == ["groq", "gemini"]  # 5xx is model-wide: skip llama's other key
+    assert result.generations[0].message.content == "answer from gemini:flash"
+
+
 async def test_all_keys_limited_fails_over_across_providers() -> None:
     script = Script()
     router = make_router(script)
@@ -341,12 +361,13 @@ async def test_context_limit_skips_target_without_calling_it() -> None:
     assert script.calls == [("cerebras", "c1", "gpt-oss-120b")]
 
 
-async def test_groq_large_request_uses_higher_tpm_model() -> None:
+async def test_large_request_uses_higher_tpm_model() -> None:
+    """Cerebras free tier: gpt-oss-120b 30k TPM vs qwen-3.8-27b 150k TPM (measured, issue #22)."""
     script = Script()
-    env = {"GROQ_API_KEY": "g1", "GROQ_RPM": "0"}
-    router = make_router(script, env=env, chain=["groq:openai/gpt-oss-120b", "groq:llama-3.3-70b-versatile"])
-    await router.agenerate("main", [HumanMessage("word " * 7_000)])  # ~9.5k: over 8k, under 12k
-    assert script.calls == [("groq", "g1", "llama-3.3-70b-versatile")]
+    env = {"CEREBRAS_API_KEY": "c1", "CEREBRAS_CONTEXT": "0"}
+    router = make_router(script, env=env, chain=["cerebras:gpt-oss-120b", "cerebras:qwen-3.8-27b"])
+    await router.agenerate("main", [HumanMessage("word " * 26_000)])  # ~33k tokens: over 30k, under 150k
+    assert script.calls == [("cerebras", "c1", "qwen-3.8-27b")]
 
 
 async def test_role_max_tokens_forwarded_and_used_for_budgeting() -> None:

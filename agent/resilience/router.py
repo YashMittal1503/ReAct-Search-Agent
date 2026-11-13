@@ -160,6 +160,7 @@ class ModelRouter:
         self.providers = dict(providers)
         self.pools: dict[str, KeyPool] = {
             name: KeyPool(name, cfg.keys, rpm=cfg.rpm, tpm=cfg.tpm, model_tpm=cfg.model_tpm,
+                          model_rpm=cfg.model_rpm,
                           cooldown_base=cooldown_base, cooldown_max=cooldown_max)
             for name, cfg in self.providers.items()
         }
@@ -340,6 +341,11 @@ class ModelRouter:
         elif err.kind is ErrorKind.TOOL_CALL_FAILED:
             skip.add(target)
             msg = f"{target.label} produced an invalid tool call → retrying on another model"
+        elif err.kind is ErrorKind.TRANSIENT and "timeout" in type(exc).__name__.lower():
+            # A hung request is usually a one-off (measured: Gemini flash-lite answers the same
+            # request in ~4s on retry), so only this key cools down; the model's other keys stay
+            # in play for this request. Each (model, key) pair is still tried at most once.
+            msg = f"{where} timed out → trying the next key"
         elif err.kind is ErrorKind.TRANSIENT:
             skip.add(target)
             msg = f"{target.label} transient error ({err.status or type(exc).__name__}) → failing over"
@@ -469,6 +475,7 @@ class ModelRouter:
             "providers": [
                 {"name": name, "label": self.providers[name].spec.label, "rpm": self.providers[name].rpm,
                  "tpm": self.providers[name].tpm, "model_tpm": dict(self.providers[name].model_tpm),
+                 "model_rpm": dict(self.providers[name].model_rpm),
                  "context": self.providers[name].context, "keys": pool.snapshot()}
                 for name, pool in self.pools.items()
             ],
