@@ -118,7 +118,8 @@ class AgentDeps:
             )
         if self.scraper_factory is None:
             self.scraper_factory = lambda: PageScraper(
-                timeout=s.scrape_timeout_seconds, max_chars=s.scrape_max_chars, concurrency=s.scrape_concurrency
+                timeout=s.scrape_timeout_seconds, max_chars=s.scrape_max_chars, concurrency=s.scrape_concurrency,
+                user_agent=s.scraper_user_agent,
             )
 
 

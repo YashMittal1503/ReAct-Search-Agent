@@ -13,11 +13,11 @@ from schemas.evidence import ScrapedPage
 
 logger = logging.getLogger(__name__)
 
+# An honest, descriptive bot User-Agent with a contact URL. Sites with bot policies (Wikimedia in
+# particular) reject generic or browser-imitating UAs with HTTP 403, so never spoof a browser here.
+DEFAULT_USER_AGENT = "DeepResearchAgent/1.0 (+https://github.com/YashMittal1503/ReAct-Search-Agent)"
 DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0 Safari/537.36 DeepResearchAgent/1.0"
-    ),
+    "User-Agent": DEFAULT_USER_AGENT,
     "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.5",
     "Accept-Language": "en-US,en;q=0.8",
 }
@@ -47,12 +47,14 @@ class PageScraper:
         max_bytes: int = 3_000_000,
         concurrency: int = 4,
         retries: int = 1,
+        user_agent: str | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self.timeout = timeout
         self.max_chars = max_chars
         self.max_bytes = max_bytes
         self.retries = retries
+        self.user_agent = user_agent or DEFAULT_USER_AGENT
         self._sem = asyncio.Semaphore(concurrency)
         self._client = client
         self._owns_client = client is None
@@ -60,7 +62,7 @@ class PageScraper:
     async def __aenter__(self) -> "PageScraper":
         if self._client is None:
             self._client = httpx.AsyncClient(
-                headers=DEFAULT_HEADERS,
+                headers={**DEFAULT_HEADERS, "User-Agent": self.user_agent},
                 timeout=httpx.Timeout(self.timeout, connect=min(5.0, self.timeout)),
                 follow_redirects=True,
                 limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),

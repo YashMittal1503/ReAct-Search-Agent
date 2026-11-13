@@ -53,3 +53,39 @@ async def test_retries_transient_status_and_truncates() -> None:
         page = await s.scrape("https://site.test/flaky")
     assert page.ok
     assert page.chars <= 302 and page.markdown.endswith("…")
+
+
+async def test_sends_configured_user_agent() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("user-agent", ""))
+        return httpx.Response(200, html=HTML)
+
+    ua = "TestBot/2.0 (+https://example.test/bot)"
+    scraper = PageScraper(user_agent=ua)
+    async with scraper:
+        # Swap in a mock transport while keeping the headers the scraper configured on its client.
+        assert scraper._client is not None
+        scraper._client._transport = httpx.MockTransport(handler)
+        page = await scraper.scrape("https://site.test/ok")
+    assert page.ok, page.error
+    assert seen == [ua]
+
+
+async def test_default_user_agent_is_descriptive_bot_ua() -> None:
+    from tools.scraper import DEFAULT_USER_AGENT
+
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("user-agent", ""))
+        return httpx.Response(200, html=HTML)
+
+    scraper = PageScraper()
+    async with scraper:
+        assert scraper._client is not None
+        scraper._client._transport = httpx.MockTransport(handler)
+        await scraper.scrape("https://site.test/ok")
+    assert seen == [DEFAULT_USER_AGENT]
+    assert "Mozilla" not in DEFAULT_USER_AGENT and "+https://" in DEFAULT_USER_AGENT

@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     scrape_timeout_seconds: float = 15.0
     scrape_max_chars: int = 12_000
     scrape_concurrency: int = 4
+    scraper_user_agent: str = Field(
+        default="DeepResearchAgent/1.0 (+https://github.com/YashMittal1503/ReAct-Search-Agent)",
+        description="Descriptive bot User-Agent sent by the page scraper; sites like Wikipedia 403 "
+                    "generic or browser-imitating UAs.")
     research_recursion_limit: int = 60
     max_report_sources: int = 12
 
