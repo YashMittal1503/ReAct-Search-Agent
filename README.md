@@ -250,7 +250,7 @@ flowchart LR
     end
     RCM --> R["ModelRouter<br/>attempt planner + failure policy"]
     R --> C1["main chain<br/>groq:gpt-oss-120b → groq:qwen3.8-27b → cerebras:gpt-oss-120b → mistral → gemini → openrouter → openai"]
-    R --> C2["fast chain<br/>groq:gpt-oss-20b → groq:qwen3.8-27b → cerebras:qwen-3.8-27b → … → main models (last resort)"]
+    R --> C2["fast chain<br/>groq:gpt-oss-20b → groq:qwen3.8-27b → cerebras:gpt-oss-120b → … → main models (last resort)"]
     R --> P1["KeyPool groq<br/>key1 key2 key3"]
     R --> P2["KeyPool gemini<br/>key1 …"]
     R --> P3["KeyPool openrouter …"]

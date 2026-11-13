@@ -199,7 +199,8 @@ def classify_error(exc: BaseException) -> ClassifiedError:
                               "model not found", "unknown model", "is not a valid model"):
         return make(ErrorKind.MODEL_UNAVAILABLE)
     if _any(msg, "tool_use_failed", "failed to call a function", "failed_generation", "tool call validation",
-            "invalid tool call", "could not parse tool"):
+            "invalid tool call", "could not parse tool", "failed to generate tool call",
+            "did not call a tool", "failed to parse tool call"):
         return make(ErrorKind.TOOL_CALL_FAILED)
     if isinstance(exc, (httpx.TimeoutException, httpx.TransportError, asyncio.TimeoutError, TimeoutError,
                         ConnectionError)) or name in {"APITimeoutError", "APIConnectionError"} \

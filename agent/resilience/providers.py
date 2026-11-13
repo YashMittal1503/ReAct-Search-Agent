@@ -68,8 +68,11 @@ PROVIDERS: dict[str, ProviderSpec] = {
                      model_tpm={"openai/gpt-oss-120b": 8_000, "openai/gpt-oss-20b": 8_000,
                                 "qwen/qwen3.8-27b": 8_000}),
         ProviderSpec("cerebras", "Cerebras", "https://api.cerebras.ai/v1", "CEREBRAS",
-                     main_models=("gpt-oss-120b",), fast_models=("qwen-3.8-27b",), default_rpm=30,
+                     main_models=("gpt-oss-120b",), fast_models=("gpt-oss-120b",), default_rpm=30,
                      # Free tier: gpt-oss-120b 5 RPM / 30k TPM; qwen-3.8-27b 450 RPM / 150k TPM.
+                     # qwen-3.8-27b is not a default: it failed 3 of 4 forced tool calls ("Failed to
+                     # generate tool call but tool_choice = 'required'") and exhausts its output budget
+                     # thinking in json_schema mode. Opt in via LLM_CHAIN_FAST if that changes.
                      model_rpm={"gpt-oss-120b": 5, "qwen-3.8-27b": 450},
                      model_tpm={"gpt-oss-120b": 30_000, "qwen-3.8-27b": 150_000},
                      context_limit=8_192),  # free-tier request cap; set CEREBRAS_CONTEXT=0 on paid plans

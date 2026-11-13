@@ -121,6 +121,11 @@ def test_pick_prefers_ready_key_then_soonest(clock: Clock) -> None:
         (api_error(404, "The model `x` does not exist"), ErrorKind.MODEL_UNAVAILABLE),
         (api_error(400, "The model `llama2-70b` has been decommissioned"), ErrorKind.MODEL_UNAVAILABLE),
         (api_error(400, "tool_use_failed: Failed to call a function"), ErrorKind.TOOL_CALL_FAILED),
+        # Forced tool calls the model didn't make (Cerebras / Groq wording, seen in eval replays):
+        (api_error(400, "Failed to generate tool_calls. Exception: Failed to generate tool call but "
+                        "tool_choice = 'required'."), ErrorKind.TOOL_CALL_FAILED),
+        (api_error(400, "Tool choice is required, but model did not call a tool"), ErrorKind.TOOL_CALL_FAILED),
+        (api_error(400, "Failed to parse tool call arguments as JSON"), ErrorKind.TOOL_CALL_FAILED),
         (api_error(400, "Invalid schema for function"), ErrorKind.INCOMPATIBLE),
         (api_error(500, "internal error"), ErrorKind.TRANSIENT),
         (api_error(402, "Payment required"), ErrorKind.QUOTA_EXHAUSTED),
